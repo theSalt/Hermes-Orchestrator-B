@@ -5,17 +5,27 @@
 
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from . import manager, proxy
 from .config import settings
-from .registry import registry
+from .registry import User, registry
 from .security import (
     PUBLIC_PATHS,
+    admin_session_issue,
+    admin_session_verify,
     check_token,
     container_name,
     dispatch_token,
@@ -77,10 +87,11 @@ def _split_user_path(path: str) -> tuple[str, str]:
     return user_id, rest
 
 
-async def _authorize(request: Request) -> tuple[str, str]:
+async def _authorize(request: Request) -> tuple[str, str, User | None]:
     """提取 user_id 并校验 dispatch token；公开探活路径放行。
 
-    返回 (user_id, stripped_path)，失败抛 HTTPException。
+    返回 (user_id, stripped_path, user)，失败抛 HTTPException。
+    token 按该用户当前的 token_version 派生——轮换后旧 token 立即失效。
     """
     user_id, stripped = _split_user_path(request.scope["path"])
     if not user_id:
@@ -88,22 +99,31 @@ async def _authorize(request: Request) -> tuple[str, str]:
     # PUBLIC_PATHS 带前导斜杠；stripped 无斜杠，归一后比较
     if f"/{stripped}" in PUBLIC_PATHS:
         # 上游本就公开的探活路径（无敏感信息）；desktop 启动握手需要匿名可达
-        return user_id, stripped
+        return user_id, stripped, None
     user = await registry.get_user(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="unknown user")
-    expected = dispatch_token(settings.secret_key, user_id)
+    expected = dispatch_token(settings.secret_key, user_id, user.token_version)
     presented = _presented_token(request) or request.cookies.get(cookie_name(user_id), "")
     if not check_token(presented, expected):
         raise HTTPException(status_code=401, detail="invalid or missing session token")
-    return user_id, stripped
+    return user_id, stripped, user
 
 
 async def require_admin(request: Request) -> None:
+    """管理鉴权双通道：Bearer admin key（curl/脚本）或登录会话 cookie（管理台）。"""
     auth = request.headers.get("authorization") or ""
     key = auth.removeprefix("Bearer ").strip()
-    if not key or key != settings.admin_key:
-        raise HTTPException(status_code=401, detail="invalid or missing admin key")
+    if key and check_token(key, settings.admin_key):
+        return
+    if admin_session_verify(
+        settings.secret_key,
+        settings.admin_key,
+        request.cookies.get(ADMIN_COOKIE, ""),
+        ttl_seconds=settings.admin_session_ttl_seconds,
+    ):
+        return
+    raise HTTPException(status_code=401, detail="invalid or missing admin credentials")
 
 
 # ── 基础 ─────────────────────────────────────────────────────
@@ -202,7 +222,8 @@ async def chat_completions_user(user_id: str, request: Request):
     user = await registry.get_user(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="unknown user")
-    if not check_token(_presented_token(request), dispatch_token(settings.secret_key, user_id)):
+    expected = dispatch_token(settings.secret_key, user_id, user.token_version)
+    if not check_token(_presented_token(request), expected):
         raise HTTPException(status_code=401, detail="invalid or missing session token")
     body = await request.json()
     chat_id = request.headers.get("x-session-id")
@@ -254,8 +275,9 @@ async def _proxy_http_entry(request: Request):
         user_id, stripped = _split_user_path(request.scope["path"])
         if not user_id:
             raise HTTPException(status_code=404, detail="invalid user id")
+        user = None
     else:
-        user_id, stripped = await _authorize(request)
+        user_id, stripped, user = await _authorize(request)
     # 任何鉴权请求都算活跃（匿名探活与 CORS 预检不算——登出的 desktop 轮询不能钉住容器）
     if method not in ("OPTIONS", "HEAD") and f"/{stripped}" not in PUBLIC_PATHS:
         manager.touch(user_id)
@@ -306,9 +328,12 @@ async def _proxy_http_entry(request: Request):
         return JSONResponse(
             {"error": {"message": str(e), "type": "agent_unavailable"}}, status_code=502
         )
-    if wants_cookie:
+    if wants_cookie and user is not None:
         resp.headers.append(
-            "set-cookie", session_cookie(user_id, dispatch_token(settings.secret_key, user_id))
+            "set-cookie",
+            session_cookie(
+                user_id, dispatch_token(settings.secret_key, user_id, user.token_version)
+            ),
         )
     return resp
 
@@ -348,7 +373,7 @@ async def proxy_ws_route(ws: WebSocket, user_id: str, rest: str = ""):
     if user is None:
         await ws.close(code=1008)
         return
-    expected = dispatch_token(settings.secret_key, user_id)
+    expected = dispatch_token(settings.secret_key, user_id, user.token_version)
     if not check_token(_ws_presented_token(ws, user_id), expected):
         # 握手 403：desktop 按连接失败重试，与上游 gate 拒绝行为一致
         await ws.close(code=1008)
@@ -379,7 +404,17 @@ async def proxy_ws_route(ws: WebSocket, user_id: str, rest: str = ""):
         manager.ws_closed(user_id)
 
 
-# ── 管理 API ─────────────────────────────────────────────────
+# ── 管理后台 ─────────────────────────────────────────────────
+#
+# 管理 API 定义在 admin_api 上，双前缀挂载（见文件末尾 include_router）：
+#   /api/...       —— 内网直连/脚本（smoke.sh 等既有调用方，保持兼容）
+#   /admin/api/... —— 管理台 UI 专用：与页面同前缀，UI 用相对路径请求，
+#                     直连与 nginx subpath 两种部署形态都自动正确。
+# 公网 nginx 对 /hermes/api/ 维持 403，仅放行 /hermes/admin/*（见 deploy/）。
+
+# 管理台构建产物（dispatch/web 经 vite 构建后 COPY 进镜像）
+WEB_DIST = Path(__file__).parent / "static" / "admin"
+ADMIN_COOKIE = "hd_admin"
 
 
 def _gateway_url_for(request: Request, user_id: str) -> str:
@@ -390,22 +425,86 @@ def _gateway_url_for(request: Request, user_id: str) -> str:
     return f"{scheme}://{host}{settings.public_path}/u/{user_id}"
 
 
-def _user_view(request: Request, user, agent: dict | None) -> dict:
+def _user_view(request: Request, user: User, agent: dict | None, include_token: bool = False) -> dict:
     last = agent.get("last_active") if agent else None
     view = {
         "user_id": user.user_id,
         "display_name": user.display_name,
         "slug": container_name(user.user_id),
         "gateway_url": _gateway_url_for(request, user.user_id),
-        # 管理面直接回显 token，便于管理员交付给用户（仅 admin key 可见）
-        "token": dispatch_token(settings.secret_key, user.user_id),
+        # token 只在创建/轮换时一次性返回（include_token=True），清单不回显：
+        # admin key 泄露不应等于存量 token 泄露；遗忘 token 走轮换
+        "token_version": user.token_version,
         "container": agent,
         "idle_seconds": int(time.time() - last) if last else None,
     }
+    if include_token:
+        view["token"] = dispatch_token(settings.secret_key, user.user_id, user.token_version)
     return view
 
 
-@router.get("/api/users", dependencies=[Depends(require_admin)])
+def _proto(request: Request) -> str:
+    """真实外部协议：优先信任反代头（nginx 已设 X-Forwarded-Proto）。"""
+    return (request.headers.get("x-forwarded-proto") or request.url.scheme).lower()
+
+
+def _admin_cookie(request: Request) -> str:
+    issued = int(time.time())
+    val = admin_session_issue(settings.secret_key, settings.admin_key, issued)
+    parts = [
+        f"{ADMIN_COOKIE}={val}",
+        "Path=/",
+        "HttpOnly",
+        # Strict：跨站请求不带 cookie（CSRF 防线）；外部链接跳入需重登一次
+        "SameSite=Strict",
+        f"Max-Age={settings.admin_session_ttl_seconds}",
+    ]
+    if _proto(request) == "https":
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+admin_api = APIRouter()
+
+
+@admin_api.post("/login", include_in_schema=False)
+async def admin_login(request: Request):
+    """管理台登录：校验 admin key，种 HttpOnly 会话 cookie。"""
+    body = await request.json() if request.headers.get("content-length") else {}
+    if not check_token(str(body.get("key") or ""), settings.admin_key):
+        raise HTTPException(status_code=401, detail="invalid admin key")
+    return JSONResponse({"status": "ok"}, headers={"set-cookie": _admin_cookie(request)})
+
+
+@admin_api.post("/logout", include_in_schema=False)
+async def admin_logout(request: Request):
+    cookie = f"{ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+    if _proto(request) == "https":
+        cookie += "; Secure"
+    return JSONResponse({"status": "ok"}, headers={"set-cookie": cookie})
+
+
+@admin_api.get("/overview", dependencies=[Depends(require_admin)])
+async def overview():
+    """服务概览：用户/容器计数与关键配置（管理台顶栏卡片）。"""
+    users = await registry.list_users()
+    agents = await manager.driver.list_managed()
+    return {
+        "users": len(users),
+        "containers_total": len(agents),
+        "containers_running": sum(1 for a in agents if a["state"] == "running"),
+        "active_ws": sum(manager.active_ws.values()),
+        "image": settings.image,
+        "network": settings.network,
+        "idle_timeout_minutes": settings.idle_timeout_minutes,
+        "public_url": settings.public_url,
+        "public_path": settings.public_path,
+        "default_user": settings.default_user,
+        "session_ttl_seconds": settings.admin_session_ttl_seconds,
+    }
+
+
+@admin_api.get("/users", dependencies=[Depends(require_admin)])
 async def list_users(request: Request):
     users = await registry.list_users()
     agents = {a["user_id"]: a for a in await manager.driver.list_managed()}
@@ -420,7 +519,7 @@ async def list_users(request: Request):
     return {"users": out}
 
 
-@router.post("/api/users", dependencies=[Depends(require_admin)])
+@admin_api.post("/users", dependencies=[Depends(require_admin)])
 async def create_user(request: Request):
     body = await request.json() if request.headers.get("content-length") else {}
     user_id = str(body.get("user_id") or "").strip()
@@ -433,10 +532,11 @@ async def create_user(request: Request):
         user = await registry.create_user(user_id, display_name)
     except KeyError as e:
         raise HTTPException(status_code=409, detail=str(e).strip("'"))
-    return _user_view(request, user, None)
+    # 唯一一次回显 token 的入口（另一个是 rotate）
+    return _user_view(request, user, None, include_token=True)
 
 
-@router.delete("/api/users/{user_id}", dependencies=[Depends(require_admin)])
+@admin_api.delete("/users/{user_id}", dependencies=[Depends(require_admin)])
 async def delete_user(user_id: str, request: Request, purge: bool = False):
     user = await registry.get_user(user_id)
     if user is None:
@@ -450,19 +550,68 @@ async def delete_user(user_id: str, request: Request, purge: bool = False):
     return {"status": "deleted", "data": "deleted" if purge else "kept"}
 
 
-@router.post("/api/users/{user_id}/restart", dependencies=[Depends(require_admin)])
+@admin_api.post("/users/{user_id}/start", dependencies=[Depends(require_admin)])
+async def start_agent(user_id: str):
+    """把容器拉到就绪（等 proxy_start_wait_seconds，超时 503 可重试）。"""
+    if await registry.get_user(user_id) is None:
+        raise HTTPException(status_code=404, detail="unknown user")
+    try:
+        await manager.ensure_ready(user_id, wait=float(settings.proxy_start_wait_seconds))
+    except RuntimeError as e:
+        return JSONResponse({"status": "starting", "detail": str(e)}, status_code=503)
+    return {"status": "ok"}
+
+
+@admin_api.post("/users/{user_id}/restart", dependencies=[Depends(require_admin)])
 async def restart_agent(user_id: str):
+    if await registry.get_user(user_id) is None:
+        raise HTTPException(status_code=404, detail="unknown user")
     await manager.ensure_ready(user_id, restart=True)
     return {"status": "ok"}
 
 
-@router.post("/api/users/{user_id}/stop", dependencies=[Depends(require_admin)])
+@admin_api.post("/users/{user_id}/stop", dependencies=[Depends(require_admin)])
 async def stop_agent(user_id: str):
     await manager.driver.stop(user_id)
     return {"status": "stopped"}
 
 
-@router.post("/api/agents/refresh", dependencies=[Depends(require_admin)])
+@admin_api.get("/users/{user_id}/logs", dependencies=[Depends(require_admin)])
+async def user_logs(user_id: str, tail: int = Query(200, ge=1, le=1000)):
+    if await registry.get_user(user_id) is None:
+        raise HTTPException(status_code=404, detail="unknown user")
+    return {
+        "user_id": user_id,
+        "tail": tail,
+        "logs": await manager.driver.logs(user_id, tail=tail),
+    }
+
+
+@admin_api.post("/users/{user_id}/token/rotate", dependencies=[Depends(require_admin)])
+async def rotate_user_token(user_id: str, request: Request):
+    """单用户 token 轮换：token_version+1 并重派生。
+
+    dispatch token 同时是容器 env 里的 dashboard 会话 token（创建时写入，
+    不可原地变更），因此必须先删容器（数据保留）再落版本；顺序不能反——
+    反序时若删容器失败，会出现"新版本已生效、旧 token 容器仍在跑"的卡死态。
+    全程持该用户的锁，与 ensure_ready 的 provision 串行。
+    """
+    user = await registry.get_user(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="unknown user")
+    async with manager.locks[user_id]:
+        await manager.driver.remove(user_id)  # absent 时 no-op；失败则中止不落版本
+        version = await registry.rotate_token_version(user_id)
+    return {
+        "status": "rotated",
+        "token_version": version,
+        "token": dispatch_token(settings.secret_key, user_id, version),
+        "gateway_url": _gateway_url_for(request, user_id),
+        "note": "容器已删除（数据保留）；用户需在 desktop 更新 token 后重连",
+    }
+
+
+@admin_api.post("/agents/refresh", dependencies=[Depends(require_admin)])
 async def refresh_agents(request: Request):
     """镜像/配置变更后生效：删容器（数据保留），下次访问按新配置重建。"""
     body = await request.json() if request.headers.get("content-length") else {}
@@ -481,3 +630,43 @@ async def refresh_agents(request: Request):
         await manager.driver.remove(uid)
         removed.append(uid)
     return {"status": "ok", "removed": removed}
+
+
+# ── 管理台页面（构建产物静态服务）──────────────────────────────
+
+
+@router.get("/admin", include_in_schema=False)
+async def admin_page():
+    """无尾斜杠归一：/admin → admin/（相对 Location——直连与 nginx subpath
+    两种形态下浏览器都能解析到正确的 /[/hermes]/admin/，且不受
+    HERMES_PUBLIC_PATH 影响：该前缀经 nginx 时已被剥掉）。"""
+    return RedirectResponse("admin/", status_code=307)
+
+
+@router.get("/admin/", include_in_schema=False)
+async def admin_page_index():
+    index = WEB_DIST / "index.html"
+    if index.is_file():
+        return FileResponse(index, media_type="text/html; charset=utf-8")
+    return HTMLResponse(
+        "<h1>hermes-dispatch 管理台</h1>"
+        "<p>前端构建产物缺失：在 dispatch/web 下执行 <code>npm install &amp;&amp; npm run build</code> "
+        "后重新构建镜像（Dockerfile 多阶段构建会自动完成）。</p>",
+        status_code=503,
+    )
+
+
+@router.get("/admin/assets/{rest:path}", include_in_schema=False)
+async def admin_assets(rest: str):
+    assets_root = (WEB_DIST / "assets").resolve()
+    target = (assets_root / rest).resolve()
+    # 防路径穿越：只允许 assets 目录内的真实文件
+    if assets_root not in target.parents or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target)
+
+
+# 管理路由挂载：/api/* 兼容既有脚本；/admin/api/* 供管理台相对路径使用
+router.include_router(admin_api, prefix="/api")
+router.include_router(admin_api, prefix="/admin/api")
+

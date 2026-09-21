@@ -16,18 +16,17 @@ from app.driver import AgentStatus
 from app.security import agent_api_key, dispatch_token
 
 
-async def test_ensure_ready_real_path(monkeypatch):
-    calls = {"provision": 0}
-
+def _patch_driver(monkeypatch, ip="10.1.1.1", *, provision_calls=None):
     async def fake_status(uid):
         return AgentStatus(user_id=uid, state="absent")
 
-    async def fake_provision(uid):
-        calls["provision"] += 1
-        return AgentStatus(user_id=uid, state="running", ip="10.1.1.1")
+    async def fake_provision(uid, token_version=0):
+        if provision_calls is not None:
+            provision_calls.append(token_version)
+        return AgentStatus(user_id=uid, state="running", ip=ip)
 
     async def fake_wait(uid, timeout):
-        return "10.1.1.1"
+        return ip
 
     async def fake_config(uid):
         return False
@@ -37,13 +36,36 @@ async def test_ensure_ready_real_path(monkeypatch):
     monkeypatch.setattr(manager.driver, "wait_healthy", fake_wait)
     monkeypatch.setattr(manager.driver, "ensure_agent_config", fake_config)
 
-    ep = await manager.ensure_ready("alice")
-    assert calls["provision"] == 1
+
+async def test_ensure_ready_real_path(monkeypatch):
+    calls = []
+    _patch_driver(monkeypatch, provision_calls=calls)
+
+    ep = await manager.ensure_ready("alice", token_version=0)
+    assert calls == [0]
     assert ep.base_url == "http://10.1.1.1:9120"
     assert ep.api_base_url == "http://10.1.1.1:8642"
-    assert ep.api_key == agent_api_key("test-secret", "alice")
-    assert ep.dispatch_tok == dispatch_token("test-secret", "alice")
+    assert ep.api_key == agent_api_key("test-secret", "alice", 0)
+    assert ep.dispatch_tok == dispatch_token("test-secret", "alice", 0)
     assert ep.started is True
+
+
+async def test_ensure_ready_passes_token_version_to_provision(monkeypatch, fake_reg):
+    await fake_reg.create_user("alice")
+    await fake_reg.rotate_token_version("alice")  # → v1
+    calls = []
+    _patch_driver(monkeypatch, provision_calls=calls)
+
+    # 显式传版本
+    ep = await manager.ensure_ready("alice", token_version=3)
+    assert calls[-1] == 3
+    assert ep.api_key == agent_api_key("test-secret", "alice", 3)
+    assert ep.dispatch_tok == dispatch_token("test-secret", "alice", 3)
+
+    # 缺省时锁内从注册表读取
+    ep = await manager.ensure_ready("alice")
+    assert calls[-1] == 1
+    assert ep.dispatch_tok == dispatch_token("test-secret", "alice", 1)
 
 
 async def test_ensure_ready_restart_on_unhealthy(monkeypatch):
@@ -55,7 +77,7 @@ async def test_ensure_ready_restart_on_unhealthy(monkeypatch):
     async def fake_stop(uid):
         return None
 
-    async def fake_provision(uid):
+    async def fake_provision(uid, token_version=0):
         return AgentStatus(user_id=uid, state="running", ip="10.1.1.2")
 
     # 第一次 wait 不健康 → 触发重启一轮；第二次健康
@@ -74,7 +96,7 @@ async def test_ensure_ready_restart_on_unhealthy(monkeypatch):
     monkeypatch.setattr(manager.driver, "wait_healthy", fake_wait)
     monkeypatch.setattr(manager.driver, "ensure_agent_config", fake_config)
 
-    ep = await manager.ensure_ready("bob")
+    ep = await manager.ensure_ready("bob", token_version=0)
     assert waits["n"] == 2
     assert ep.base_url == "http://10.1.1.2:9120"
 
@@ -87,7 +109,7 @@ async def test_ensure_ready_short_wait_no_restart(monkeypatch):
     async def fail_wait(uid, timeout):
         return None
 
-    async def fake_provision(uid):
+    async def fake_provision(uid, token_version=0):
         raise AssertionError("短等待不应触发重启重试")
 
     monkeypatch.setattr(manager.driver, "status", fake_status)
@@ -96,7 +118,7 @@ async def test_ensure_ready_short_wait_no_restart(monkeypatch):
     monkeypatch.setattr(manager.driver, "provision", fake_provision)
 
     with pytest.raises(RuntimeError):
-        await manager.ensure_ready("alice", wait=7)
+        await manager.ensure_ready("alice", wait=7, token_version=0)
 
 
 async def test_warm_async_runs_ensure_ready(monkeypatch):

@@ -24,7 +24,7 @@ locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # 活跃 WS 连接计数：desktop 的长连接本身就是活跃证据
 active_ws: dict[str, int] = defaultdict(int)
 
-# 内存活跃度（代理请求路径的快速缓存）；清扫循环周期性与 SQLite 对齐
+# 内存活跃度（代理请求路径的快速缓存）；清扫循环周期性与注册表对齐
 last_active: dict[str, float] = {}
 
 
@@ -77,7 +77,7 @@ def touch(user_id: str) -> None:
 
 
 async def flush_active() -> None:
-    """把内存活跃度刷入 SQLite（清扫循环调用；调度服务重启不丢空闲计时）。"""
+    """把内存活跃度刷入注册表（清扫循环调用；调度服务重启不丢空闲计时）。"""
     from .registry import registry
 
     for uid, ts in list(last_active.items()):
@@ -104,24 +104,34 @@ async def get_last_active(user_id: str) -> float | None:
 
 
 async def ensure_ready(
-    user_id: str, restart: bool = False, wait: float | None = None
+    user_id: str,
+    restart: bool = False,
+    wait: float | None = None,
+    token_version: int | None = None,
 ) -> AgentEndpoint:
     """确保该用户的 agent 容器运行且 dashboard 就绪，返回代理端点。
 
     restart=True 用于连接失败后的恢复：强制 stop→start→等健康。
     wait：健康等待上限，默认 start_timeout_seconds；代理路径传更短的
     proxy_start_wait_seconds 以免把 desktop 的探针拖死。
+    token_version：派生容器内两把 key 的版本；缺省时锁内从注册表读取——
+    锁内读取与 rotate（同锁）串行，保证轮换后的下一次 provision 一定用新版本。
     """
     started = False
     timeout = wait if wait is not None else float(settings.start_timeout_seconds)
     async with locks[user_id]:
+        if token_version is None:
+            from .registry import registry
+
+            user = await registry.get_user(user_id)
+            token_version = user.token_version if user else 0
         st = await driver.status(user_id)
         if restart and st.state == "running":
             logger.info("restart requested for %s", container_name(user_id))
             await driver.stop(user_id)
             st = await driver.status(user_id)
         if st.state != "running":
-            st = await driver.provision(user_id)
+            st = await driver.provision(user_id, token_version=token_version)
             started = True
 
         ip = await driver.wait_healthy(user_id, timeout)
@@ -134,7 +144,7 @@ async def ensure_ready(
             # 短等待（探活快速失败，wait<30）不重试——由后台预热接力
             logger.warning("agent %s not healthy, restarting once", container_name(user_id))
             await driver.stop(user_id)
-            await driver.provision(user_id)
+            await driver.provision(user_id, token_version=token_version)
             started = True
             ip = await driver.wait_healthy(user_id, timeout)
         if ip is None:
@@ -145,8 +155,8 @@ async def ensure_ready(
         return AgentEndpoint(
             base_url=f"http://{ip}:{settings.forwarder_port}",
             api_base_url=f"http://{ip}:{settings.agent_port}",
-            api_key=agent_api_key(settings.secret_key, user_id),
-            dispatch_tok=dispatch_token(settings.secret_key, user_id),
+            api_key=agent_api_key(settings.secret_key, user_id, token_version),
+            dispatch_tok=dispatch_token(settings.secret_key, user_id, token_version),
             started=started,
         )
 

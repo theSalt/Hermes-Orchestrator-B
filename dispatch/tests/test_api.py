@@ -1,12 +1,7 @@
-"""API 鉴权网关与管理端点（monkeypatch 掉 docker/上游，不起真容器）。"""
+"""API 鉴权网关与管理端点（monkeypatch 掉 docker/上游，不起真容器）。
 
-import os
-import tempfile
-
-_tmp = tempfile.mkdtemp(prefix="hermes-dispatch-test-")
-os.environ.setdefault("HERMES_DATA_DIR", _tmp)
-os.environ.setdefault("HERMES_ADMIN_KEY", "test-admin-key")
-os.environ.setdefault("HERMES_SECRET_KEY", "test-secret")
+环境变量与 FakeRegistry 注入见 tests/conftest.py。
+"""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,11 +10,10 @@ from app import manager, proxy
 from app.config import settings
 from app.main import app
 from app.security import dispatch_token, user_slug
-from app.registry import registry
 
 
 @pytest.fixture()
-def client(monkeypatch):
+def client(monkeypatch, fake_reg):
     captured = {}
 
     def fake_proxy_http(method, upstream_url, headers, request_stream, **kw):
@@ -35,6 +29,7 @@ def client(monkeypatch):
         return run()
 
     async def fake_ensure_ready(user_id, restart=False, wait=None):
+        captured.setdefault("ready_calls", []).append((user_id, restart, wait))
         return manager.AgentEndpoint(
             base_url="http://10.9.9.9:9120",
             api_base_url="http://10.9.9.9:8642",
@@ -45,8 +40,19 @@ def client(monkeypatch):
     async def fake_noop(user_id):
         return None
 
+    async def fake_remove(user_id):
+        captured.setdefault("removed", []).append(user_id)
+
+    async def fake_purge(user_id):
+        captured.setdefault("purged", []).append(user_id)
+
     async def fake_list_managed():
         return []
+
+    async def fake_logs(user_id, tail=200):
+        captured["logs_uid"] = user_id
+        captured["logs_tail"] = tail
+        return f"log line 1 for {user_id}\nlog line 2 (tail={tail})"
 
     async def fake_sweep():
         return []
@@ -54,10 +60,11 @@ def client(monkeypatch):
     monkeypatch.setattr(proxy, "proxy_http", fake_proxy_http)
     monkeypatch.setattr(manager, "ensure_ready", fake_ensure_ready)
     # driver 的容器操作一律替换（单元测试不碰 docker daemon）
-    monkeypatch.setattr(manager.driver, "purge", fake_noop)
-    monkeypatch.setattr(manager.driver, "remove", fake_noop)
+    monkeypatch.setattr(manager.driver, "purge", fake_purge)
+    monkeypatch.setattr(manager.driver, "remove", fake_remove)
     monkeypatch.setattr(manager.driver, "stop", fake_noop)
     monkeypatch.setattr(manager.driver, "list_managed", fake_list_managed)
+    monkeypatch.setattr(manager.driver, "logs", fake_logs)
     monkeypatch.setattr(manager, "sweep_once", fake_sweep)
     with TestClient(app) as c:
         captured["client"] = c
@@ -383,3 +390,245 @@ def test_ws_accepts_cookie_auth(client, monkeypatch):
     c.cookies.set(f"hd_{user_slug('alice')}", tok)
     with c.websocket_connect("/u/alice/api/ws"):
         pass
+
+
+# ── 管理台：登录会话 / 新端点 ─────────────────────────────────
+
+
+def _login(c, key="test-admin-key", path="/admin/api/login"):
+    return c.post(path, json={"key": key})
+
+
+def test_admin_login_sets_cookie(client):
+    c, _ = client
+    r = _login(c)
+    assert r.status_code == 200
+    cookie = r.headers.get("set-cookie", "")
+    assert "hd_admin=" in cookie
+    assert "httponly" in cookie.lower()
+    assert "samesite=strict" in cookie.lower()
+    assert "path=/" in cookie.lower()
+    assert "secure" not in cookie.lower()  # http 直连不加 Secure
+    assert "max-age=86400" in cookie.lower()
+
+
+def test_admin_login_wrong_key_401(client):
+    c, _ = client
+    assert _login(c, key="wrong").status_code == 401
+    assert _login(c, key="").status_code == 401
+
+
+def test_admin_cookie_auth_works(client):
+    c, _ = client
+    assert c.get("/api/users").status_code == 401  # 未登录
+    _login(c)  # TestClient 会话自动保存 cookie
+    assert c.get("/api/users").status_code == 200  # cookie 通道
+    assert c.get("/admin/api/users").status_code == 200  # 双前缀挂载
+
+
+def test_admin_bad_cookie_401(client):
+    c, _ = client
+    c.cookies.set("hd_admin", "123.garbage-sig")
+    assert c.get("/api/users").status_code == 401
+
+
+def test_bad_bearer_good_cookie_passes(client):
+    """双通道 OR 语义：坏 Bearer 落到 cookie 校验，好 cookie 放行。"""
+    c, _ = client
+    _login(c)
+    r = c.get("/api/users", headers={"Authorization": "Bearer wrong-key"})
+    assert r.status_code == 200
+
+
+def test_bearer_still_works_after_login_feature(client):
+    """既有 Bearer 通道回归（smoke.sh 兼容）。"""
+    c, _ = client
+    r = c.get("/api/users", headers={"Authorization": "Bearer test-admin-key"})
+    assert r.status_code == 200
+
+
+def test_admin_page_served_without_auth(client):
+    c, _ = client
+    r = c.get("/admin", follow_redirects=False)
+    assert r.status_code == 307
+    # 相对 Location：直连与 nginx subpath 两种形态都能正确归一到 admin/
+    assert r.headers["location"] == "admin/"
+    # 前端构建产物不在测试环境 → 503 占位页；有产物 → 200。均为 HTML
+    r = c.get("/admin/")
+    assert r.status_code in (200, 503)
+    assert "text/html" in r.headers.get("content-type", "")
+
+
+def test_logout_clears_cookie(client):
+    c, _ = client
+    r = c.post("/admin/api/logout")
+    assert r.status_code == 200
+    assert "max-age=0" in r.headers.get("set-cookie", "").lower()
+
+
+def test_create_user_view_includes_token_version(client):
+    c, _ = client
+    body = _mkuser(c, "carol")
+    assert body["token_version"] == 0
+
+
+def test_list_view_does_not_echo_token(client):
+    """token 仅创建/轮换时一次性返回；清单不回显（admin key 泄露 ≠ token 泄露）。"""
+    c, _ = client
+    body = _mkuser(c, "alice")
+    assert body["token"]  # 创建响应一次性携带
+    users = c.get(
+        "/api/users", headers={"Authorization": "Bearer test-admin-key"}
+    ).json()["users"]
+    assert users and all("token" not in u for u in users)
+
+
+def test_rotate_changes_token_and_recreates_container(client):
+    c, cap = client
+    old = _mkuser(c, "alice")
+    assert old["token_version"] == 0
+
+    r = c.post(
+        "/api/users/alice/token/rotate",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "rotated"
+    assert body["token_version"] == 1
+    assert body["token"] != old["token"]
+    assert body["token"] == dispatch_token("test-secret", "alice", 1)
+    assert body["gateway_url"].endswith("/u/alice")
+    # 先删容器（数据保留）再落版本
+    assert cap["removed"] == ["alice"]
+
+    # 列表视图反映新版本，但不回显 token（仅创建/轮换一次性展示）
+    users = c.get(
+        "/api/users", headers={"Authorization": "Bearer test-admin-key"}
+    ).json()["users"]
+    alice = next(u for u in users if u["user_id"] == "alice")
+    assert alice["token_version"] == 1
+    assert "token" not in alice
+
+
+def test_rotate_unknown_user_404(client):
+    c, _ = client
+    r = c.post(
+        "/api/users/nobody/token/rotate",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 404
+
+
+def test_old_token_rejected_after_rotate(client):
+    """轮换全链路：旧 token 401，新 token 通过 dispatch 层。"""
+    c, _ = client
+    old = _mkuser(c, "alice")["token"]
+    r = c.post(
+        "/api/users/alice/token/rotate",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    new = r.json()["token"]
+
+    assert c.get("/u/alice/", headers={"X-Hermes-Session-Token": old}).status_code == 401
+    assert c.get("/u/alice/", headers={"X-Hermes-Session-Token": new}).status_code == 200
+
+
+def test_logs_endpoint(client):
+    c, cap = client
+    _mkuser(c, "alice")
+    r = c.get(
+        "/api/users/alice/logs",
+        params={"tail": 5},
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 200
+    assert cap["logs_uid"] == "alice"
+    assert cap["logs_tail"] == 5
+    assert "log line 1 for alice" in r.json()["logs"]
+
+    r = c.get(
+        "/api/users/nobody/logs",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 404
+
+
+def test_logs_tail_out_of_range_422(client):
+    c, _ = client
+    _mkuser(c, "alice")
+    r = c.get(
+        "/api/users/alice/logs",
+        params={"tail": 5000},
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 422
+
+
+def test_start_endpoint(client):
+    c, cap = client
+    _mkuser(c, "alice")
+    r = c.post(
+        "/api/users/alice/start",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 200
+    assert cap["ready_calls"][-1][0] == "alice"  # ensure_ready 被调
+    assert cap["ready_calls"][-1][2] == float(settings.proxy_start_wait_seconds)
+
+    r = c.post(
+        "/api/users/nobody/start",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 404
+
+
+def test_start_timeout_returns_503(client, monkeypatch):
+    c, _ = client
+
+    async def fail_ready(user_id, restart=False, wait=None):
+        raise RuntimeError("agent 容器未就绪")
+
+    monkeypatch.setattr(manager, "ensure_ready", fail_ready)
+    _mkuser(c, "alice")
+    r = c.post(
+        "/api/users/alice/start",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 503
+    assert "starting" in r.json()["status"]
+
+
+def test_restart_unknown_user_404(client):
+    c, _ = client
+    r = c.post(
+        "/api/users/nobody/restart",
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 404
+
+
+def test_overview_counts(client, monkeypatch):
+    c, _ = client
+
+    async def fake_list():
+        return [
+            {"user_id": "alice", "name": "hb-a", "state": "running", "started_at": ""},
+            {"user_id": "bob", "name": "hb-b", "state": "exited", "started_at": ""},
+        ]
+
+    monkeypatch.setattr(manager.driver, "list_managed", fake_list)
+    _mkuser(c, "alice")
+    r = c.get("/api/overview", headers={"Authorization": "Bearer test-admin-key"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["users"] >= 1
+    assert body["containers_total"] == 2
+    assert body["containers_running"] == 1
+    assert body["image"] == settings.image
+    assert body["idle_timeout_minutes"] == settings.idle_timeout_minutes
+
+
+def test_overview_requires_admin(client):
+    c, _ = client
+    assert c.get("/api/overview").status_code == 401

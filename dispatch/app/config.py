@@ -51,6 +51,10 @@ class Settings:
         self.admin_key: str = os.environ.get("HERMES_ADMIN_KEY", "dev-admin-key")
         # 派生每用户 dispatch token / agent API key 的 HMAC 密钥（生产必须改掉默认值）
         self.secret_key: str = os.environ.get("HERMES_SECRET_KEY", "dev-secret-change-me")
+        # 管理后台登录会话的有效期（秒）；换 admin_key 即全体管理会话失效
+        self.admin_session_ttl_seconds: int = _env_int(
+            "HERMES_ADMIN_SESSION_TTL_SECONDS", 86400
+        )
 
         # ── 服务 ──────────────────────────────────────────────
         self.port: int = _env_int("HERMES_PORT", 8644)
@@ -75,7 +79,10 @@ class Settings:
         self.mem_limit: str = os.environ.get("HERMES_MEM_LIMIT", "2g")
 
         # ── 存储 ─────────────────────────────────────────────
-        # dispatch 容器视角的数据根目录（写种子文件 / SQLite 注册表）
+        # users 注册表（PostgreSQL）。compose 侧默认由 POSTGRES_* 组装，
+        # 直跑/特殊部署时可整体覆盖
+        self.database_url: str = os.environ.get("HERMES_DATABASE_URL", "")
+        # dispatch 容器视角的数据根目录（写种子文件等）
         self.data_dir: str = os.environ.get("HERMES_DATA_DIR", "/data/DockerVolume/hermes-b")
         # agent 容器 bind mount 的源路径（= 宿主机视角；单卷双挂时两者相同）
         self.data_host_dir: str = (

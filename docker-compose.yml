@@ -7,23 +7,59 @@
 #   docker pull docker.1ms.run/nousresearch/hermes-agent:latest
 #   docker compose build agent-image
 #
+# 用户注册表存储于内置 postgres（named volume pgdata；.env 里 POSTGRES_*
+# 组装 HERMES_DATABASE_URL，也可整体覆盖）。
+#
 # 启动：  docker compose up -d --build
 # 日志：  docker compose logs -f dispatch
 
 name: hermes-b
 
 services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: hermes-b-pg
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      POSTGRES_USER: ${POSTGRES_USER:-hermes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 设置}
+      POSTGRES_DB: ${POSTGRES_DB:-hermes}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - hermes-b-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   dispatch:
-    build: ./dispatch
+    build:
+      context: ./dispatch
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     image: hermes-dispatch:0.1.0
     container_name: hermes-dispatch
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "${HERMES_PORT:-8644}:8644"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       HERMES_ADMIN_KEY: ${HERMES_ADMIN_KEY:?请在 .env 设置}
       HERMES_SECRET_KEY: ${HERMES_SECRET_KEY:?请在 .env 设置}
+      HERMES_DATABASE_URL: ${HERMES_DATABASE_URL:-postgresql://${POSTGRES_USER:-hermes}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hermes}}
+      HERMES_ADMIN_SESSION_TTL_SECONDS: ${HERMES_ADMIN_SESSION_TTL_SECONDS:-86400}
       HERMES_PUBLIC_URL: ${HERMES_PUBLIC_URL:-}
       HERMES_PUBLIC_PATH: ${HERMES_PUBLIC_PATH:-}
       HERMES_LOG_LEVEL: ${HERMES_LOG_LEVEL:-INFO}
@@ -78,3 +114,6 @@ services:
 networks:
   hermes-b-net:
     name: hermes-b-net
+
+volumes:
+  pgdata: {}

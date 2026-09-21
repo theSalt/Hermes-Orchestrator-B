@@ -1,27 +1,29 @@
-"""用户注册表：SQLite（数据卷上，WAL 模式）。
+"""用户注册表：PostgreSQL（asyncpg，真 async）。
 
-多用户注册信息量小（用户/活跃度），SQLite 经 asyncio.to_thread 访问足够；
-比起 A 方案的 PG 少一个外部依赖。容器重建不丢（数据卷持久化）。
+注册信息量小（用户/活跃度/token 版本），连接池 min=1/max=5 足够。
+并发不再靠应用层锁串行化，由单语句原子性 + 主键约束保证：
+  - create_user 用 INSERT ... ON CONFLICT DO NOTHING RETURNING（重复 → KeyError → 409）
+  - rotate_token_version 用 UPDATE ... RETURNING（无 check-then-act 窗口）
+生产路径唯一实现 PgRegistry；离线单测用 tests/conftest.py 的 FakeRegistry
+（同接口内存版），两者都满足 RegistryBackend Protocol。
+
+历史说明：初版为数据卷上的 SQLite（registry.db）；换 PG 后不再读取，
+旧文件留在卷上无副作用，可手动清理。
 """
 
-import asyncio
-import logging
-import os
-import sqlite3
+import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Protocol, runtime_checkable
 
-logger = logging.getLogger("hermes-dispatch.registry")
+import asyncpg
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    user_id      TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL DEFAULT '',
-    created_at   REAL NOT NULL,
-    last_active  REAL
-);
-"""
+from .config import settings
+
+# 表名仅用于测试注入独立表；白名单校验防拼接注入
+_TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+_COLUMNS = "user_id, display_name, created_at, last_active, token_version"
 
 
 @dataclass
@@ -30,6 +32,8 @@ class User:
     display_name: str
     created_at: float
     last_active: float | None
+    # 0 = 初代派生（消息 dispatch:<uid>）；管理台轮换一次 +1（消息带 #v<n>）
+    token_version: int = 0
 
     def dict(self) -> dict:
         return {
@@ -37,120 +41,128 @@ class User:
             "display_name": self.display_name,
             "created_at": self.created_at,
             "last_active": self.last_active,
+            "token_version": self.token_version,
         }
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    # asyncio.to_thread 每次可能在不同线程执行，允许跨线程复用连接；
-    # 并发由 Registry._lock（asyncio 层）串行化
-    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+@runtime_checkable
+class RegistryBackend(Protocol):
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    async def create_user(self, user_id: str, display_name: str = "") -> User: ...
+
+    async def get_user(self, user_id: str) -> User | None: ...
+
+    async def list_users(self) -> list[User]: ...
+
+    async def delete_user(self, user_id: str) -> bool: ...
+
+    async def touch(self, user_id: str, ts: float | None = None) -> None: ...
+
+    async def get_last_active(self, user_id: str) -> float | None: ...
+
+    async def rotate_token_version(self, user_id: str) -> int | None: ...
 
 
-class Registry:
-    def __init__(self, db_path: str | None = None) -> None:
-        self._db_path = db_path or os.path.join(
-            os.environ.get("HERMES_DATA_DIR", "/data/DockerVolume/hermes-b"), "registry.db"
-        )
-        self._conn: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
+def _user(row: asyncpg.Record) -> User:
+    return User(**dict(row))
+
+
+class PgRegistry:
+    def __init__(self, dsn: str | None = None, table: str = "users") -> None:
+        if not _TABLE_RE.fullmatch(table or ""):
+            raise ValueError(f"invalid registry table name: {table!r}")
+        self._dsn = dsn if dsn is not None else settings.database_url
+        self._table = table
+        self._pool: asyncpg.Pool | None = None
 
     async def start(self) -> None:
-        def _start() -> None:
-            self._conn = _connect(self._db_path)
-            self._conn.executescript(_SCHEMA)
-            self._conn.commit()
-
-        # asyncio.Lock 与事件循环绑定：每次 start 重建，
-        # 兼容重启/测试中"同一单例跑在多个循环里"的情形
-        self._lock = asyncio.Lock()
-        async with self._lock:
-            await asyncio.to_thread(_start)
+        if not self._dsn:
+            raise RuntimeError(
+                "HERMES_DATABASE_URL 未设置（compose 部署已默认组装；直跑需显式配置）"
+            )
+        self._pool = await asyncpg.create_pool(
+            self._dsn, min_size=1, max_size=5, command_timeout=10
+        )
+        async with self._pool.acquire() as conn:
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self._table} (
+                    user_id       TEXT PRIMARY KEY,
+                    display_name  TEXT NOT NULL DEFAULT '',
+                    created_at    DOUBLE PRECISION NOT NULL,
+                    last_active   DOUBLE PRECISION,
+                    token_version INTEGER NOT NULL DEFAULT 0
+                )""")
 
     async def close(self) -> None:
-        if self._conn is not None:
-            await asyncio.to_thread(self._conn.close)
-            self._conn = None
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
 
-    def _require_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
+    def _require_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
             raise RuntimeError("registry not started")
-        return self._conn
+        return self._pool
 
     async def create_user(self, user_id: str, display_name: str = "") -> User:
-        def _create() -> User:
-            conn = self._require_conn()
-            now = time.time()
-            conn.execute(
-                "INSERT INTO users (user_id, display_name, created_at) VALUES (?, ?, ?)",
-                (user_id, display_name, now),
-            )
-            conn.commit()
-            return User(user_id, display_name, now, None)
-
-        async with self._lock:
-            try:
-                return await asyncio.to_thread(_create)
-            except sqlite3.IntegrityError as e:
-                raise KeyError(f"user '{user_id}' already exists") from e
+        row = await self._require_pool().fetchrow(
+            f"INSERT INTO {self._table} (user_id, display_name, created_at) "
+            "VALUES ($1, $2, $3) "
+            "ON CONFLICT (user_id) DO NOTHING "
+            f"RETURNING {_COLUMNS}",
+            user_id,
+            display_name,
+            time.time(),
+        )
+        if row is None:
+            raise KeyError(f"user '{user_id}' already exists")
+        return _user(row)
 
     async def get_user(self, user_id: str) -> User | None:
-        def _get() -> User | None:
-            row = self._require_conn().execute(
-                "SELECT * FROM users WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            return User(**dict(row)) if row else None
-
-        async with self._lock:
-            return await asyncio.to_thread(_get)
+        row = await self._require_pool().fetchrow(
+            f"SELECT {_COLUMNS} FROM {self._table} WHERE user_id = $1", user_id
+        )
+        return _user(row) if row else None
 
     async def list_users(self) -> list[User]:
-        def _list() -> list[User]:
-            rows = self._require_conn().execute(
-                "SELECT * FROM users ORDER BY created_at"
-            ).fetchall()
-            return [User(**dict(r)) for r in rows]
-
-        async with self._lock:
-            return await asyncio.to_thread(_list)
+        # 双键排序：同秒创建的次序确定性（与 FakeRegistry 语义对齐）
+        rows = await self._require_pool().fetch(
+            f"SELECT {_COLUMNS} FROM {self._table} ORDER BY created_at, user_id"
+        )
+        return [_user(r) for r in rows]
 
     async def delete_user(self, user_id: str) -> bool:
-        def _delete() -> bool:
-            conn = self._require_conn()
-            cur = conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-            conn.commit()
-            return cur.rowcount > 0
-
-        async with self._lock:
-            return await asyncio.to_thread(_delete)
+        tag = await self._require_pool().execute(
+            f"DELETE FROM {self._table} WHERE user_id = $1", user_id
+        )
+        return tag == "DELETE 1"
 
     async def touch(self, user_id: str, ts: float | None = None) -> None:
-        """活跃度落库。代理路径高频调用：单行 UPDATE（WAL 下开销可接受）。"""
-        def _touch() -> None:
-            conn = self._require_conn()
-            conn.execute(
-                "UPDATE users SET last_active = ? WHERE user_id = ?",
-                (ts if ts is not None else time.time(), user_id),
-            )
-            conn.commit()
-
-        async with self._lock:
-            await asyncio.to_thread(_touch)
+        """活跃度落库。代理路径高频调用：单行 UPDATE。"""
+        await self._require_pool().execute(
+            f"UPDATE {self._table} SET last_active = $2 WHERE user_id = $1",
+            user_id,
+            ts if ts is not None else time.time(),
+        )
 
     async def get_last_active(self, user_id: str) -> float | None:
-        def _get() -> float | None:
-            row = self._require_conn().execute(
-                "SELECT last_active FROM users WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            return row["last_active"] if row and row["last_active"] else None
+        row = await self._require_pool().fetchrow(
+            f"SELECT last_active FROM {self._table} WHERE user_id = $1", user_id
+        )
+        return row["last_active"] if row else None
 
-        async with self._lock:
-            return await asyncio.to_thread(_get)
+    async def rotate_token_version(self, user_id: str) -> int | None:
+        """token_version+1 并返回新值；用户不存在返回 None。"""
+        row = await self._require_pool().fetchrow(
+            f"UPDATE {self._table} SET token_version = token_version + 1 "
+            "WHERE user_id = $1 "
+            "RETURNING token_version",
+            user_id,
+        )
+        return row["token_version"] if row else None
 
 
 # 进程级单例（main lifespan 负责 start/close）
-registry = Registry()
+registry = PgRegistry()

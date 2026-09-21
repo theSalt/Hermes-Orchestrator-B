@@ -8,6 +8,10 @@ __pycache__/
 .venv/
 venv/
 
+# 管理台前端（构建产物由 Dockerfile 阶段构建，不入库）
+dispatch/web/node_modules/
+dispatch/app/static/admin/
+
 # macOS
 .DS_Store
 

@@ -94,7 +94,7 @@ class DockerDriver:
             env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return str(agent_dir)
 
-    def _create_or_start(self, user_id: str) -> AgentStatus:
+    def _create_or_start(self, user_id: str, token_version: int = 0) -> AgentStatus:
         name = container_name(user_id)
         self._seed_dir(user_id)
         self._ensure_network()
@@ -104,14 +104,16 @@ class DockerDriver:
             "API_SERVER_ENABLED": "true",
             "API_SERVER_HOST": "0.0.0.0",
             "API_SERVER_PORT": str(settings.agent_port),
-            "API_SERVER_KEY": agent_api_key(settings.secret_key, user_id),
+            "API_SERVER_KEY": agent_api_key(settings.secret_key, user_id, token_version),
             # Dashboard（desktop 的协议面）：必须绑环回——非环回绑定会强制启用
             # auth gate 且 WS 拒绝 ?token=（token 模式失效）。经 overlay 的
             # dashboard-forwarder(:9120) 在 docker 内网暴露，dispatch 反代。
             "HERMES_DASHBOARD": "1",
             "HERMES_DASHBOARD_HOST": "127.0.0.1",
             "HERMES_DASHBOARD_PORT": str(settings.dashboard_port),
-            "HERMES_DASHBOARD_SESSION_TOKEN": dispatch_token(settings.secret_key, user_id),
+            "HERMES_DASHBOARD_SESSION_TOKEN": dispatch_token(
+                settings.secret_key, user_id, token_version
+            ),
             "HERMES_DASH_FWD_PORT": str(settings.forwarder_port),
         }
         if settings.pypi_mirror:
@@ -205,6 +207,18 @@ class DockerDriver:
             logger.info("purging data dir %s", target)
             shutil.rmtree(target)
 
+    def _logs(self, user_id: str, tail: int = 200) -> str:
+        try:
+            c = self.client.containers.get(container_name(user_id))
+        except NotFound:
+            return ""
+        try:
+            out = c.logs(tail=tail)
+        except docker.errors.APIError as e:
+            logger.warning("logs failed for %s: %s", container_name(user_id), e)
+            return ""
+        return out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
+
     def _list_managed(self) -> list[dict]:
         out = []
         for c in self.client.containers.list(
@@ -226,8 +240,8 @@ class DockerDriver:
     async def status(self, user_id: str) -> AgentStatus:
         return await asyncio.to_thread(self._status, user_id)
 
-    async def provision(self, user_id: str) -> AgentStatus:
-        return await asyncio.to_thread(self._create_or_start, user_id)
+    async def provision(self, user_id: str, token_version: int = 0) -> AgentStatus:
+        return await asyncio.to_thread(self._create_or_start, user_id, token_version)
 
     async def stop(self, user_id: str) -> None:
         await asyncio.to_thread(self._stop, user_id)
@@ -242,6 +256,10 @@ class DockerDriver:
 
     async def list_managed(self) -> list[dict]:
         return await asyncio.to_thread(self._list_managed)
+
+    async def logs(self, user_id: str, tail: int = 200) -> str:
+        """最近 tail 行容器日志（管理台查看）；容器不存在返回空串。"""
+        return await asyncio.to_thread(self._logs, user_id, tail)
 
     async def wait_healthy(self, user_id: str, timeout: float) -> str | None:
         """轮询直至 dashboard（forwarder → 环回 dashboard）的 /api/health 返回 200。

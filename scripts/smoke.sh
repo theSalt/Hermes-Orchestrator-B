@@ -28,10 +28,18 @@ curl_sf "$BASE/health" | grep -q '"ok"' || fail "dispatch /health"
 ok "dispatch /health"
 
 echo "== 2. create users =="
-ALICE=$(curl_sf -X POST "$BASE/api/users" -H "Authorization: Bearer $ADMIN_KEY" \
+# 幂等建用户：已存在（409）时改走轮换——清单不回显 token（仅创建/轮换
+# 一次性展示），轮换是唯一能重新取得 token 的途径
+ALICE=$(curl -s -X POST "$BASE/api/users" -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' -d '{"user_id":"alice","display_name":"Alice"}')
-BOB=$(curl_sf -X POST "$BASE/api/users" -H "Authorization: Bearer $ADMIN_KEY" \
+BOB=$(curl -s -X POST "$BASE/api/users" -H "Authorization: Bearer $ADMIN_KEY" \
   -H 'Content-Type: application/json' -d '{"user_id":"bob"}')
+if ! echo "$ALICE" | $JQ -e .token >/dev/null 2>&1; then
+  ALICE=$(curl_sf -X POST "$BASE/api/users/alice/token/rotate" -H "Authorization: Bearer $ADMIN_KEY")
+fi
+if ! echo "$BOB" | $JQ -e .token >/dev/null 2>&1; then
+  BOB=$(curl_sf -X POST "$BASE/api/users/bob/token/rotate" -H "Authorization: Bearer $ADMIN_KEY")
+fi
 ALICE_TOKEN=$(echo "$ALICE" | $JQ -r .token)
 ALICE_URL=$(echo "$ALICE" | $JQ -r .gateway_url)
 BOB_TOKEN=$(echo "$BOB" | $JQ -r .token)
@@ -39,7 +47,12 @@ BOB_TOKEN=$(echo "$BOB" | $JQ -r .token)
 ok "alice: $ALICE_URL"
 
 echo "== 3. anonymous probes (desktop 启动握手) =="
-code "$BASE/u/alice/api/health" | grep -q 200 || fail "匿名 /api/health 应 200（首次会触发冷启动，请重跑）"
+# 冷启动等待：探活 5s 快速失败由这里代 desktop 重试（新建/轮换后容器需重建）
+for _ in $(seq 1 24); do
+  [ "$(code "$BASE/u/alice/api/health")" = "200" ] && break
+  sleep 5
+done
+code "$BASE/u/alice/api/health" | grep -q 200 || fail "匿名 /api/health 应 200（冷启动超时，请重跑）"
 code "$BASE/u/alice/api/status" | grep -q 200 || fail "匿名 /api/status 应 200"
 ok "匿名探活路径 200"
 
