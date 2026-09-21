@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import manager, proxy
+from app.config import settings
 from app.main import app
 from app.security import dispatch_token, user_slug
 from app.registry import registry
@@ -303,6 +304,34 @@ def test_options_preflight_passes_without_auth(client):
     _mkuser(c, "alice")
     r = c.options("/u/alice/api/status", headers={"Origin": "http://localhost:3000"})
     assert r.status_code == 200
+
+
+def test_subpath_public_path_mode(client, monkeypatch):
+    """nginx subpath 模式（HERMES_PUBLIC_PATH=/hermes，nginx 已剥前缀转发）：
+    路由/鉴权不变；三处对外语义带前缀——gateway_url / cookie Path / X-Forwarded-Prefix。"""
+    c, cap = client
+    monkeypatch.setattr(settings, "public_path", "/hermes")
+    tok = _mkuser(c, "alice")["token"]
+
+    # 管理 API 返回的 gateway_url 可直接粘贴进 desktop（带 subpath）
+    r = c.get(
+        "/api/users", headers={"Authorization": "Bearer test-admin-key"}
+    )
+    assert any(
+        u["gateway_url"].endswith("/hermes/u/alice") for u in r.json()["users"]
+    )
+
+    # ?token= 首开种 cookie：Path 必须含 subpath，否则浏览器在 /hermes/u/... 下不回带
+    r = c.get(f"/u/alice/?token={tok}")
+    assert r.status_code == 200
+    assert "Path=/hermes/u/alice" in r.headers.get("set-cookie", "")
+
+    # 转发上游的 X-Forwarded-Prefix 带 subpath（dashboard 据此重建资源 URL）
+    r = c.get("/u/alice/assets/app.js", headers={"X-Hermes-Session-Token": tok})
+    assert r.status_code == 200
+    assert cap["headers"]["x-forwarded-prefix"] == "/hermes/u/alice"
+    # 内部路由不受外部前缀影响（nginx 已剥掉）
+    assert cap["upstream_url"] == "http://10.9.9.9:9120/assets/app.js"
 
 
 def test_trailing_backtick_in_path_param_stripped(client):

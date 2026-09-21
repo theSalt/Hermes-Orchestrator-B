@@ -44,6 +44,60 @@ docker compose logs -f dispatch
 
 首次 `up` 会自动构建 overlay 镜像 `hermes-agent:desktop`（基于 1ms.run 基线 + dashboard-forwarder）。基线镜像更新后：`docker compose build agent-image && curl -XPOST .../api/agents/refresh`。
 
+## 经 nginx subpath 访问（117 现行：devdemo :8888 ssl，公网端口映射）
+
+统一入口 `https://devdemo.devpod.cn:8888/hermes/...`（域名解析公网隧道 IP 47.92.92.6，
+端口映射回 117 的 nginx；办公室内外同一 URL）。dispatch 侧 `.env`：
+
+```
+HERMES_PUBLIC_PATH=/hermes                            # 外部前缀
+HERMES_PUBLIC_URL=https://devdemo.devpod.cn:8888      # 管理 API 回显的 gateway_url 基座
+```
+
+nginx 侧是 devdemo 的完整替换文件 `deploy/nginx-devdemo-hermes.conf`（内含 WS 升级/长超时/
+流式/上传体积四项关键配置）。**公网暴露面已收口**：`/hermes/v1/*`（无鉴权冒烟口）与
+`/hermes/api/*`（管理 API）在 nginx 直接 403，只放行 `/hermes/u/<uid>/`（token 鉴权）与
+`/hermes/health`；建用户/运维走内网直连 `http://192.168.0.117:8644`。
+
+```bash
+sudo cp /data/workspace/hermes-orchestrator-b/deploy/nginx-devdemo-hermes.conf \
+        /etc/nginx/sites-enabled/devdemo
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+原理：nginx 在 `location /hermes/` 处剥掉前缀转发（dispatch 路由不变）；dispatch 依
+`HERMES_PUBLIC_PATH` 修正三处对外语义——转发上游的 `X-Forwarded-Prefix`（dashboard 用它
+重建 SPA 资源 URL，必须带外部前缀）、会话 cookie 的 `Path`、管理 API 的 `gateway_url`。
+nginx 不改写响应内容。Desktop Remote URL / 浏览器链接统一用
+`https://devdemo.devpod.cn:8888/hermes/u/<user_id>`（建用户时管理 API 直接返回）；
+直连 `:8644` 在内网依旧可用。
+
+**自签证书（CN=devdemo.devpod.cn，无 IP SAN）的客户端信任**（URL 均须域名形态，Node
+严格校验主机名，IP 形态即使证书受信也报 mismatch）：
+- 浏览器：首次访问点继续/信任即可；要消警告就把证书导入系统信任库。
+- Hermes Desktop 分两条腿，信任来源不同（源码 `windows-system-ca.ts`：加载系统证书库
+  仅 Windows 生效）：
+  - **Windows**：一步到位——证书导入「受信任的根证书颁发机构」，主进程（自动读系统证书库）
+    与渲染进程（Chromium）同时覆盖：
+    ```powershell
+    certutil -addstore -f ROOT devdemo.devpod.cn.crt   # 管理员；或双击 .crt 图形导入
+    ```
+  - **macOS**：两条腿分别配——
+    - 主进程（Node，不读钥匙串）：`NODE_EXTRA_CA_CERTS` 启动
+      ```bash
+      openssl s_client -connect devdemo.devpod.cn:8888 -servername devdemo.devpod.cn </dev/null 2>/dev/null \
+        | openssl x509 -outform PEM > ~/.trustssl/devdemo.devpod.cn.pem
+      # 当前登录会话一次，之后 Dock 点开也带（注销/重启后需重设）：
+      launchctl setenv NODE_EXTRA_CA_CERTS "$HOME/.trustssl/devdemo.devpod.cn.pem"
+      # 或单次启动：open -a Hermes --env NODE_EXTRA_CA_CERTS="$HOME/.trustssl/devdemo.devpod.cn.pem"
+      ```
+    - 渲染进程（Chromium，不认环境变量）：导入钥匙串并信任
+      ```bash
+      sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain \
+        ~/.trustssl/devdemo.devpod.cn.pem
+      ```
+  - 配完 **⌘Q 完全退出重启** Desktop 生效。
+
 ## 建用户 & 桌面接入
 
 ```bash
@@ -70,7 +124,8 @@ curl -s -XPOST $BASE/api/users \
 http://192.168.0.117:8644/u/<user_id>/?token=<token>
 ```
 
-首次带 `?token=` 打开后，dispatch 种下 HttpOnly 会话 cookie（Path 限定 `/u/<uid>`，30 天），
+首次带 `?token=` 打开后，dispatch 种下 HttpOnly 会话 cookie（Path 限定 `/u/<uid>`，
+经 nginx subpath 时为 `/hermes/u/<uid>`，30 天），
 之后该路径下的静态资源/API/WS 全部凭 cookie 放行，把整条链接发给用户即可。
 注意：内网 HTTP 明文，cookie 与 token 同源同暴露面；跨站侧 SameSite=Lax + 上游 CORS 白名单兜底。
 （`8644/` 根路径本身仍是纯 API：调度服务的用户界面就是官方 Desktop / 各用户的 Web 控制台。）

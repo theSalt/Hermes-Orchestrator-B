@@ -55,9 +55,10 @@ def session_cookie(user_id: str, token: str) -> str:
 
     首次用 ?token= 打开 /u/<uid>/ 后种下；后续 <script>/fetch/WS 等浏览器
     原生请求不带自定义头，凭此 cookie 放行。HttpOnly + SameSite=Lax。
+    Path 含外部 subpath 前缀（nginx /hermes/ 场景），否则浏览器不会回带。
     """
     return (
-        f"{cookie_name(user_id)}={token}; Path=/u/{user_id}; "
+        f"{cookie_name(user_id)}={token}; Path={settings.public_path}/u/{user_id}; "
         "HttpOnly; SameSite=Lax; Max-Age=2592000"
     )
 
@@ -383,10 +384,10 @@ async def proxy_ws_route(ws: WebSocket, user_id: str, rest: str = ""):
 
 def _gateway_url_for(request: Request, user_id: str) -> str:
     if settings.public_url:
-        return f"{settings.public_url}/u/{user_id}"
+        return f"{settings.public_url}{settings.public_path}/u/{user_id}"
     host = request.headers.get("host") or f"localhost:{settings.port}"
     scheme = request.headers.get("x-forwarded-proto") or "http"
-    return f"{scheme}://{host}/u/{user_id}"
+    return f"{scheme}://{host}{settings.public_path}/u/{user_id}"
 
 
 def _user_view(request: Request, user, agent: dict | None) -> dict:

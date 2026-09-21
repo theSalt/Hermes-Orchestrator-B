@@ -81,10 +81,15 @@ def _filter_response_headers(headers) -> dict:
 
 
 def forwarded_headers(user_id: str, proto: str, client_host: str) -> dict:
-    """每次代理注入的头：Host 重写 + Forwarded 语义。"""
+    """每次代理注入的头：Host 重写 + Forwarded 语义。
+
+    X-Forwarded-Prefix 含外部 subpath（HERMES_PUBLIC_PATH，如 /hermes）：
+    上游 dashboard 据此重建 SPA 资源 URL/cookie path，浏览器经 nginx subpath
+    访问时资源路径必须带完整外部前缀。
+    """
     return {
         "Host": f"127.0.0.1:{settings.dashboard_port}",
-        "X-Forwarded-Prefix": f"/u/{user_id}",
+        "X-Forwarded-Prefix": f"{settings.public_path}/u/{user_id}",
         "X-Forwarded-Proto": proto,
         "X-Forwarded-For": client_host,
     }
@@ -178,6 +183,9 @@ async def proxy_ws(
             while True:
                 msg = await ws.receive()
                 if msg["type"] == "websocket.disconnect":
+                    logger.debug(
+                        "ws client disconnected: code=%s", msg.get("code")
+                    )
                     await upstream.close(code=msg.get("code") or 1000)
                     return
                 if msg["type"] == "websocket.receive":
@@ -197,6 +205,11 @@ async def proxy_ws(
                     await ws.send_text(message)
                 else:
                     await ws.send_bytes(message)
+            logger.debug(
+                "ws upstream closed: code=%s reason=%r",
+                getattr(upstream, "close_code", None),
+                getattr(upstream, "close_reason", "") or "",
+            )
             await ws.close(code=1000)
         except Exception:
             try:

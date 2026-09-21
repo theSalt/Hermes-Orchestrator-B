@@ -36,6 +36,12 @@ def _env_octal(name: str, default: str) -> int:
         return 0o777
 
 
+def _normalize_path_prefix(raw: str) -> str:
+    """/hermes、hermes/、//hermes/ → /hermes；空串/根 → 空串（无前缀）。"""
+    p = "/" + raw.strip().strip("/")
+    return "" if p == "/" else p
+
+
 class Settings:
     """运行配置；在进程启动时读取一次。"""
 
@@ -51,6 +57,11 @@ class Settings:
         # 对外公布的 gateway URL 前缀（管理 API 返回给用户粘贴进 desktop）。
         # 置空则按请求的 Host 反推。
         self.public_url: str = os.environ.get("HERMES_PUBLIC_URL", "").rstrip("/")
+        # 反代 subpath 前缀（如经 nginx /hermes/ 访问时设 /hermes）。nginx 剥掉该
+        # 前缀后转发；dispatch 用它修正 X-Forwarded-Prefix / cookie Path / gateway_url。
+        self.public_path: str = _normalize_path_prefix(
+            os.environ.get("HERMES_PUBLIC_PATH", "")
+        )
 
         # ── agent 运行时 ─────────────────────────────────────
         # overlay 镜像（基线 + dashboard-forwarder），见 agent-overlay/

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """WS 探针：验证 desktop 的主传输通道（JSON-RPC over /api/ws）经 dispatch 可用。
 
-用法：python3 scripts/ws_probe.py <gateway_url> <token>
+用法：python3 scripts/ws_probe.py <gateway_url> <token> [--insecure]
 例：  python3 scripts/ws_probe.py http://192.168.0.117:8644/u/alice <token>
+      python3 scripts/ws_probe.py https://192.168.0.117:8888/hermes/u/alice <token> --insecure
 
 验证点：
   1. ?token= 握手通过 dispatch → forwarder → dashboard 全链路
@@ -11,6 +12,8 @@
 """
 
 import asyncio
+import contextlib
+import ssl
 import sys
 import urllib.parse
 import urllib.request
@@ -23,10 +26,12 @@ async def main() -> int:
         print(__doc__)
         return 2
     base_url, token = sys.argv[1], sys.argv[2]
+    insecure = "--insecure" in sys.argv[3:]
 
     # 1) 先走一遍匿名探活（desktop 启动握手同款）
     status_url = base_url.rstrip("/") + "/api/status"
-    with urllib.request.urlopen(status_url, timeout=15) as resp:
+    ctx = ssl._create_unverified_context() if insecure else None
+    with urllib.request.urlopen(status_url, timeout=15, context=ctx) as resp:
         print(f"[probe] GET /api/status -> {resp.status}")
         body = resp.read().decode("utf-8", "replace")
         print(f"[probe] {body[:200]}")
@@ -39,7 +44,14 @@ async def main() -> int:
     )
     print(f"[ws] connecting {ws_url}")
 
-    async with websockets.connect(ws_url, max_size=None, open_timeout=30) as ws:
+    ssl_ws = None
+    if insecure and ws_scheme == "wss":
+        ssl_ws = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ws.check_hostname = False
+        ssl_ws.verify_mode = ssl.CERT_NONE
+    async with websockets.connect(
+        ws_url, max_size=None, open_timeout=30, ssl=ssl_ws
+    ) as ws:
         print("[ws] connected")
 
         async def recv_some():

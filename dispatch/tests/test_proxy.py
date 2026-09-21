@@ -36,6 +36,24 @@ def test_forwarded_headers():
     assert out["X-Forwarded-For"] == "10.0.0.1"
 
 
+def test_forwarded_headers_with_public_path(monkeypatch):
+    """nginx subpath 模式：X-Forwarded-Prefix 必须带外部前缀（上游据此重建
+    SPA 资源 URL，浏览器资源请求经 nginx 时要带上 /hermes 才能路由回来）。"""
+    monkeypatch.setattr(settings, "public_path", "/hermes")
+    out = forwarded_headers("alice", "http", "10.0.0.1")
+    assert out["X-Forwarded-Prefix"] == "/hermes/u/alice"
+
+
+def test_normalize_path_prefix():
+    from app.config import _normalize_path_prefix
+
+    assert _normalize_path_prefix("/hermes") == "/hermes"
+    assert _normalize_path_prefix("hermes/") == "/hermes"
+    assert _normalize_path_prefix("  /hermes/ ") == "/hermes"
+    assert _normalize_path_prefix("") == ""
+    assert _normalize_path_prefix("/") == ""
+
+
 def test_filter_response_headers_keeps_multiple_cookies():
     headers = [
         ("Content-Type", "text/html"),
