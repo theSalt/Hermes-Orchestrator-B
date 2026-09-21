@@ -1,0 +1,16 @@
+# 密钥/环境配置（含真实 key，严禁入库；模板见 .env.example）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/

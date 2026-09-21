@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+# dashboard 环回转发服务：0.0.0.0:${HERMES_DASH_FWD_PORT:-9120} → 127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}
+# 详见 ../dashboard_forwarder.py 模块注释。venv 的 python 一定存在，用绝对路径。
+exec /opt/hermes/.venv/bin/python /opt/hermes/dashboard_forwarder.py
