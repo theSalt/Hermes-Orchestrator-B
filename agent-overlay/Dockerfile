@@ -35,6 +35,19 @@ RUN mkdir -p /etc/s6-overlay/s6-rc.d/dashboard-forwarder && \
     printf 'longrun\n' > /etc/s6-overlay/s6-rc.d/dashboard-forwarder/type && \
     touch /etc/s6-overlay/s6-rc.d/user/contents.d/dashboard-forwarder
 
+# ---- Dashboard SPA：浏览器经反代 subpath 访问白屏修复 ----
+# 上游以 vite 默认 base="/" 构建内置 dashboard，懒加载 chunk 的 modulepreload/
+# CSS 预加载 URL 由编译期常量拼成站点根绝对路径，不认 X-Forwarded-Prefix；
+# 经 /hermes/u/<uid>/ 反代访问时这些请求绕过前缀 → nginx 404 → CSS 预加载
+# 失败 reject 整个懒加载 → React 树崩 → 白屏（HTML 入口/CSS url()/API/WS
+# 上游本就改写或按 __HERMES_BASE_PATH__ 解析，均正常，故只有懒加载碎裂）。
+# Desktop 客户端自带渲染层走 JSON-RPC，不经此 SPA，不受影响。
+# 修法：预加载 helper 的 base 拼接改为读取上游 _serve_index 已注入的
+# window.__HERMES_BASE_PATH__（反代=/hermes/u/<uid>；直连=undefined 行为不变），
+# 被改 chunk 重命名 + 全局更新引用，防止 immutable 缓存拿到旧内容。
+COPY fix-dashboard-base.py /tmp/fix-dashboard-base.py
+RUN python3 /tmp/fix-dashboard-base.py && rm /tmp/fix-dashboard-base.py
+
 # ---- 系统层：LibreOffice + PDF/OCR 工具 + 中文字体 ----
 # --no-install-recommends 去掉 java 等推荐包；writer/calc/impress 三件套覆盖
 # docx/xlsx/pptx → pdf 的 headless 转换（soffice --convert-to）。
