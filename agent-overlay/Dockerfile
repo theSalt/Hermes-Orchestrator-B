@@ -1,4 +1,5 @@
-# hermes-agent overlay：为 Hermes Desktop 多用户接入补"环回转发"能力 + 常用办公处理包。
+# hermes-agent overlay：为 Hermes Desktop 多用户接入补"环回转发"能力 + 常用办公处理包
+# + dashboard 附件插件（hermes-attachments）。
 #
 # 背景（详见 ../docs/design.md）：desktop 的 token 鉴权模式要求 dashboard 绑定环回
 # （非环回绑定会强制启用 OAuth/密码 gate，且 WS 拒绝 ?token=）。因此 dashboard 固定绑
@@ -14,8 +15,31 @@
 #     + Noto CJK 字体（基线仅有文泉驿正黑，matplotlib/LibreOffice 出中文会缺字）
 #   hermes 既有关键依赖用 constraints-hermes.txt 锁死，避免 uv 解析时被顶掉版本。
 #
+# dashboard 附件插件（dashboard-plugin/，源码见该目录）：
+#   - chat 页工具条上传/下载 + 附件抽屉（图片内联预览、Office 经容器内 LibreOffice
+#     转 PDF 预览），上游官方插件体系分发：装入 bundled plugins 目录（默认激活）。
+#   - 前端 IIFE 由 node 阶段构建（React 取宿主 SDK，不打包）；后端 plugin_api.py
+#     由上游网关启动时挂载到 /api/plugins/hermes-attachments/。
+#
 # 基线可经 build-arg 覆盖；默认走 1ms.run 加速（Docker Hub 直连受限的环境）。
+# NODE_IMAGE 供下方 plugin-web 阶段用；FROM 引用的 ARG 必须在首个 FROM 前
+# 声明（全局区）——stage 之间声明的 ARG 对下一个 FROM 不可见（实测构建会报
+# "base name should not be blank"，同 dispatch/Dockerfile 的写法）。
 ARG BASE_IMAGE=docker.1ms.run/nousresearch/hermes-agent:latest
+ARG NODE_IMAGE=node:22-alpine
+
+# ── 阶段 0：附件插件前端（IIFE 单文件；React 取宿主 SDK，绝不打包）─────────
+FROM ${NODE_IMAGE} AS plugin-web
+# npm 源可经 build-arg 覆盖（默认 npmmirror，适配受限网络）
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+WORKDIR /src/plugin
+COPY dashboard-plugin/package.json dashboard-plugin/package-lock.json* ./
+RUN npm config set registry ${NPM_REGISTRY} && \
+    { [ -f package-lock.json ] && npm ci --no-audit --no-fund || npm install --no-audit --no-fund; }
+COPY dashboard-plugin/ ./
+RUN npm run build   # 产物 /src/plugin/dashboard/dist/index.js
+
+# ── 主阶段：基线 + overlay ─────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
 
 # Himalaya CLI 邮件客户端（pimalaya/himalaya，静态二进制；IMAP/SMTP/JMAP/Gmail）。
@@ -120,4 +144,33 @@ import bs4, lxml, html2text, imapclient
 import pandas, numpy, matplotlib, tabulate, chardet, pytesseract
 import httpx, openai, pydantic, PIL
 print("office overlay: python imports OK")
+EOF
+
+# ---- Dashboard 附件插件 hermes-attachments（上传/下载/预览 + Office→PDF）----
+# 装入 bundled plugins 目录（bundled 源默认激活，免 plugins.enabled 配置）。
+# 目录路径构建期用上游自己的函数动态解析：模块/路径漂移时这里直接失败（fail-fast），
+# 不会静默装错位置。不设 HERMES_BUNDLED_PLUGINS——覆盖该 env 会把上游自带插件
+# （memory/kanban 等）一起藏掉。
+# 注意：manifest/dist/plugin_api.py 都在 <plugin>/dashboard/ 下（上游发现约定
+# <root>/<plugin>/dashboard/manifest.json）。
+COPY --from=plugin-web /src/plugin/dashboard/dist/index.js /tmp/ha/dist/index.js
+COPY dashboard-plugin/dashboard/manifest.json \
+     dashboard-plugin/dashboard/plugin_api.py /tmp/ha/
+RUN set -eux; \
+    PLUGDIR="$(/opt/hermes/.venv/bin/python -c 'from hermes_cli.plugins import get_bundled_plugins_dir as f; print(f())')"; \
+    DEST="$PLUGDIR/hermes-attachments/dashboard"; \
+    mkdir -p "$DEST/dist"; \
+    install -m 0644 /tmp/ha/manifest.json "$DEST/manifest.json"; \
+    install -m 0644 /tmp/ha/plugin_api.py "$DEST/plugin_api.py"; \
+    install -m 0644 /tmp/ha/dist/index.js "$DEST/dist/index.js"; \
+    rm -rf /tmp/ha; \
+    # 构建期验证：用上游自己的发现函数确认插件会被发现（manifest/位置全对才算过）
+    /opt/hermes/.venv/bin/python - "$PLUGDIR" <<'EOF'
+import sys
+
+from hermes_cli.web_server_dashboard import _discover_dashboard_plugins
+
+names = [p["name"] for p in _discover_dashboard_plugins()]
+assert "hermes-attachments" in names, f"插件未被上游发现: {names}"
+print("dashboard plugin discovered:", names)
 EOF

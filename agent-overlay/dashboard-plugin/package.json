@@ -1,0 +1,14 @@
+{
+  "name": "hermes-attachments-plugin",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Hermes dashboard 插件：聊天附件上传/下载/预览（图片内联，Office 转 PDF）",
+  "scripts": {
+    "build": "tsc --noEmit && vite build"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11"
+  }
+}

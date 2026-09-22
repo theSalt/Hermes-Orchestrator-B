@@ -1,0 +1,10 @@
+{
+  "name": "hermes-attachments",
+  "label": "附件",
+  "description": "聊天附件：上传/下载/预览（图片内联，Office 转 PDF 渲染）",
+  "icon": "FileText",
+  "version": "0.1.0",
+  "tab": { "path": "/attachments", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

@@ -1,0 +1,4 @@
+# 构建上下文瘦身：依赖与构建产物一律在镜像内生成
+dashboard-plugin/node_modules/
+dashboard-plugin/dashboard/dist/
+__pycache__/

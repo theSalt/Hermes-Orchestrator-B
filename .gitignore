@@ -12,6 +12,10 @@ venv/
 dispatch/web/node_modules/
 dispatch/app/static/admin/
 
+# dashboard 附件插件（构建产物由 Dockerfile 阶段构建，不入库）
+agent-overlay/dashboard-plugin/node_modules/
+agent-overlay/dashboard-plugin/dashboard/dist/
+
 # macOS
 .DS_Store
 

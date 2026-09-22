@@ -99,7 +99,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # 一次性构建 overlay agent 镜像（dashboard-forwarder s6 服务）。
+  # 一次性构建 overlay agent 镜像（dashboard-forwarder s6 服务 + 附件插件）。
   # 只 build 不跑；基线镜像更新后重新 `docker compose build agent-image` +
   # `POST /api/agents/refresh` 生效。
   agent-image:
@@ -109,6 +109,8 @@ services:
         BASE_IMAGE: ${HERMES_BASE_IMAGE:-docker.1ms.run/nousresearch/hermes-agent:latest}
         APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
         PYPI_INDEX: ${HERMES_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     image: ${HERMES_IMAGE:-hermes-agent:desktop}
     entrypoint: ["true"]
     restart: "no"

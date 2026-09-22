@@ -36,6 +36,7 @@ docker pull docker.1ms.run/nousresearch/hermes-agent:latest
 # 2. 上传项目（本机执行；注意在仓库根目录执行）
 rsync -a --exclude .env --exclude .git --exclude 'dispatch/.venv' --exclude 'dispatch/.pytest_cache' \
   --exclude '**/__pycache__' --exclude 'dispatch/web/node_modules' --exclude 'dispatch/app/static/admin' \
+  --exclude 'agent-overlay/dashboard-plugin/node_modules' --exclude 'agent-overlay/dashboard-plugin/dashboard/dist' \
   ./ ubuntu@192.168.0.117:/data/workspace/hermes-orchestrator-b/
 
 # 3. 配置并启动
@@ -175,6 +176,25 @@ http://192.168.0.117:8644/u/<user_id>/?token=<token>
 注意：内网 HTTP 明文，cookie 与 token 同源同暴露面；跨站侧 SameSite=Lax + 上游 CORS 白名单兜底。
 （`8644/` 根路径本身仍是纯 API：调度服务的用户界面就是官方 Desktop / 各用户的 Web 控制台。）
 
+### 聊天附件插件（hermes-attachments，随 overlay 镜像内置）
+
+Web 控制台的 Chat 页自带「附件」能力（上游官方 dashboard 插件体系实现，
+源码在 `agent-overlay/dashboard-plugin/`，随 agent 镜像分发，无需任何 per-user 配置）：
+
+- **上传**：Chat 页输入框下方工具条「📎 上传」（支持拖拽），多文件顺序上传；
+  完成后自动把文件路径引用预填进聊天输入框（形如 `[附件] /opt/data/attachments/...`，
+  **不代发**，自行补一句指令回车即可让 agent 读文件）
+- **预览/下载/管理**：工具条「🗂 附件」打开全屏抽屉——清单（大小/时间/类型）、
+  图片内联预览、docx/xlsx/pptx 容器内 LibreOffice 转 PDF 预览（带 mtime 缓存）、
+  一键下载、复制路径、删除
+- **存储**：`/opt/data/attachments/`（= 宿主机 `data_dir/hb-<slug>/attachments/`），
+  随用户数据生命周期走（删用户 `?purge=1` 时一并清除）
+- **边界**：上传单文件默认上限 200MB（经 agent 容器 env `HERMES_PLUGIN_ATTACH_MAX_MB`
+  调整，注入方式见 `.env.example`）；转换超时 `HERMES_PLUGIN_SOFFICE_TIMEOUT`（默认 120s）
+- 后端 API 挂载于该用户 dashboard 的 `/api/plugins/hermes-attachments/*`
+  （上传/清单/内联文件/转 PDF/删除），自动继承 dashboard 会话 token 鉴权；
+  插件是否生效可用 `GET /u/<uid>/api/dashboard/plugins` 查验
+
 ## 故障排查（Desktop 连不上）
 
 ### ① macOS「本地网络」权限（实测踩坑：报 could not reach，服务器零请求）
@@ -260,6 +280,9 @@ dispatch 已对 `path` 参数统一剥尾（反引号/星号/结尾括号标注�
 BASE=http://192.168.0.117:8644 ADMIN_KEY=<key> ./scripts/smoke.sh
 # 覆盖：健康/建用户/匿名探活/401/用户隔离/容器冷启动/dashboard token 模式确认
 
+BASE=http://192.168.0.117:8644 ADMIN_KEY=<key> ./scripts/attachment-smoke.sh
+# 覆盖：附件插件（发现/资源/中文文件名上传/清单/转PDF+缓存/内联输出/路径穿越/删除）
+
 python3 scripts/ws_probe.py http://192.168.0.117:8644/u/alice <token>
 # 覆盖：WS 全链路（dispatch → forwarder → dashboard /api/ws）
 
@@ -289,6 +312,7 @@ cd dispatch && python3 -m pytest tests -q   # 单元测试（不起容器；PG �
 - **换模型/改 env**：改 `.env` → `docker compose up -d dispatch`（env 变了）→ `POST /api/agents/refresh`；只改模型配置种子则还需清用户卷上的 INIT 标记或提升 `driver.INIT_VERSION`
 - **基线镜像升级**：`docker pull <基线>` → 同步更新 `agent-overlay/constraints-hermes.txt`（对照基线 `uv pip list`）→ `docker compose build agent-image` → 冒烟验证（`scripts/smoke.sh` 协议面 + `scripts/office-smoke.sh` 办公包，后者在服务器上 `docker run --rm --entrypoint bash --memory=2g -v .../office-smoke.sh:/tmp/office-smoke.sh hermes-agent:desktop /tmp/office-smoke.sh`）→ `POST /api/agents/refresh`
 - **overlay 办公包增删**：改 `agent-overlay/requirements-office.txt` 后重新 `docker compose build agent-image`；注意 uv 步骤必须带 `--no-config`（基线 WORKDIR=/opt/hermes 的 pyproject.toml 设了 `exclude-newer="14 days"`，否则新包解析被冻结在两周前）。Himalaya 二进制随仓库分发（`agent-overlay/vendor/`），升级时下载新 release 覆盖并同步 Dockerfile 里的 sha256
+- **附件插件更新**：改 `agent-overlay/dashboard-plugin/`（前端 `npm run build` 本地验证后，镜像内 node 阶段会重新构建）→ `docker compose build agent-image` → `POST /api/agents/refresh`。构建期会用上游 `_discover_dashboard_plugins()` 自检插件是否被发现（失败即构建失败）；改 `plugin_api.py` 的路由**必须重建容器**才挂载（上游仅在网关启动时挂插件 API）
 - **用户忘 token**：token 不再回显（仅创建/轮换时展示一次）——走单用户轮换，把新 token 交给用户重配 desktop
 - **单用户换 token**：管理台「轮换 token」或 `POST /api/users/{uid}/token/rotate`——旧 token 立即失效、容器重建（数据保留），desktop 需更新 token 重连
 - **彻底删用户**：`DELETE /api/users/{uid}?purge=1`（容器+记忆/会话/文件全清）
