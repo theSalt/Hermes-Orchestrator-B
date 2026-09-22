@@ -214,7 +214,7 @@ export function Drawer(): React.ReactElement | null {
             )}
           </div>
         </div>
-        {toast.toast}
+        {toast.toastNode}
       </div>
     </div>
   )

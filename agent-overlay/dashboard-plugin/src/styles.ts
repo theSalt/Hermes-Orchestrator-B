@@ -5,9 +5,10 @@
 
 const CSS = `
 .ha-toolbar{display:flex;align-items:center;gap:8px;padding:4px 8px;flex-wrap:wrap;font-size:13px}
-.ha-btn{display:inline-flex;align-items:center;gap:4px;border:1px solid rgba(127,127,127,.35);background:transparent;
-  color:inherit;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;line-height:1.6}
-.ha-btn:hover{background:rgba(127,127,127,.15)}
+/* 平按钮：无底色无边框，hover 才有淡底——不抢 chat 页视觉 */
+.ha-btn{display:inline-flex;align-items:center;gap:4px;border:none;background:transparent;
+  color:var(--text-secondary,#9aa0a6);border-radius:6px;padding:3px 8px;font-size:12px;cursor:pointer;line-height:1.6}
+.ha-btn:hover{background:rgba(127,127,127,.12);color:inherit}
 .ha-btn[disabled]{opacity:.5;cursor:default}
 .ha-chip{display:inline-flex;align-items:center;gap:6px;max-width:260px;padding:2px 10px;border-radius:999px;
   background:rgba(127,127,127,.15);font-size:12px}
@@ -42,6 +43,11 @@ const CSS = `
 .ha-preview-body iframe{width:100%;height:100%;border:none;background:#fff}
 .ha-empty{color:#8a8f98;padding:24px;text-align:center;font-size:13px;line-height:1.8}
 .ha-error{color:#f87171;font-size:13px;text-align:center;line-height:1.8}
+.ha-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:10001;
+  max-width:min(560px,90vw);padding:8px 16px;border-radius:8px;font-size:13px;color:#e6e6e6;
+  background:#23262d;border:1px solid rgba(127,127,127,.25);box-shadow:0 6px 24px rgba(0,0,0,.4)}
+.ha-toast-success{border-color:rgba(74,222,128,.4)}
+.ha-toast-error{border-color:rgba(248,113,113,.5)}
 @media (max-width:760px){
   .ha-drawer{width:100vw}
   .ha-drawer-body{flex-direction:column}

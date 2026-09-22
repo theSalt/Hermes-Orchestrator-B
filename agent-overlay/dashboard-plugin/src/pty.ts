@@ -1,37 +1,24 @@
 /** 把文本预填进 chat TUI 的输入框（不代发）。
  *
- * chat 页终端是 xterm over PTY WS（/api/pty，纯文本帧，非 JSON）——上游图片上传
- * （/image <path> + \r）与 /copy 都是同款字节注入。本插件只发文本、不发 \r，
- * 文本即停留在 TUI 输入框内，由用户自行补指令后回车。
- * 预填文本以「[附件] 」开头，避免以 / 开头被 TUI 误判为 slash 命令。
+ * chat 终端是 xterm over PTY WS（/api/pty）。不能另开 WS 连接写 PTY：
+ * 上游 keep-alive 会话只允许一个挂接 socket，插件的第二条连接会把自己页面
+ * 那条顶掉（表现为 Chat disconnected，踩过）。
+ * 正确路径：向 xterm 的隐藏 textarea 派发合成 paste 事件——与 Ctrl+V 同一条
+ * 处理链路（xterm onPaste → 写入 PTY），走页面自己那条连接，文本停留输入框。
+ * 前缀「[附件] 」避免整体被误读为 slash 命令。
  */
-import { getSdk } from './sdk'
 
 export async function prefill(text: string): Promise<void> {
-  const sdk = getSdk()
-  if (!sdk) throw new Error('插件 SDK 不可用')
-  const url = await sdk.api.buildWsUrl('/api/pty')
-  const ws = new WebSocket(url)
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('pty 连接超时')), 8000)
-      ws.onopen = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-      ws.onerror = () => {
-        clearTimeout(timer)
-        reject(new Error('pty 连接失败'))
-      }
-    })
-    ws.send(text) // 关键：无 \r / \n —— 只预填，不提交
-    // 留出字节冲刷时间再关连接，避免尾帧被丢弃
-    await new Promise((resolve) => setTimeout(resolve, 200))
-  } finally {
-    try {
-      ws.close()
-    } catch {
-      /* noop */
-    }
-  }
+  const ta = document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')
+  if (!ta) throw new Error('找不到 chat 终端输入区（请先进入 Chat 页）')
+  const dt = new DataTransfer()
+  dt.setData('text/plain', text)
+  const ev = new ClipboardEvent('paste', {
+    clipboardData: dt,
+    bubbles: true,
+    cancelable: true,
+  })
+  ta.dispatchEvent(ev)
+  // 不确定宿主是否异步消费：留给 xterm 一拍处理时间
+  await new Promise((resolve) => setTimeout(resolve, 80))
 }

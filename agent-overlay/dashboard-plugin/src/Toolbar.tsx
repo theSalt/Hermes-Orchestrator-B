@@ -1,10 +1,11 @@
 /** chat:bottom 插槽：📎 上传 + 上传 chips + 附件抽屉入口 + 拖拽上传。
  * 宿主渲染 slot 组件时不传 props；状态经 store.ts 与 Drawer 共享。
+ * 按钮用自绘 .ha-btn（透明平按钮）而非宿主 Button——宿主主题底色在 chat 页太跳。
  */
 import React, { useRef, useState } from 'react'
 import { api } from './api'
 import { prefill } from './pty'
-import { comp, useToastSafe } from './sdk'
+import { useToastSafe } from './sdk'
 import { store, useStore } from './store'
 
 export function Toolbar(): React.ReactElement {
@@ -13,7 +14,6 @@ export function Toolbar(): React.ReactElement {
   const busyRef = useRef(false)
   const [dragOver, setDragOver] = useState(false)
   const toast = useToastSafe()
-  const Btn = comp('Button')
 
   async function uploadAll(fileList: FileList | File[]): Promise<void> {
     const files = Array.from(fileList)
@@ -74,16 +74,14 @@ export function Toolbar(): React.ReactElement {
           e.currentTarget.value = ''
         }}
       />
-      {Btn ? (
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        <Btn {...(btnProps as any)} onClick={() => inputRef.current?.click()}>
-          📎 上传
-        </Btn>
-      ) : (
-        <button className="ha-btn" {...btnProps} onClick={() => inputRef.current?.click()}>
-          📎 上传
-        </button>
-      )}
+      <button
+        className="ha-btn"
+        title="上传附件"
+        {...btnProps}
+        onClick={() => inputRef.current?.click()}
+      >
+        📎
+      </button>
       {chips.map((chip) => (
         <span key={chip.id} className="ha-chip" title={chip.message ?? chip.name}>
           {chip.state === 'uploading' ? (
@@ -97,17 +95,10 @@ export function Toolbar(): React.ReactElement {
         </span>
       ))}
       <span style={{ flex: 1 }} />
-      {Btn ? (
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        <Btn {...({} as any)} onClick={() => store.setDrawer(true)}>
-          🗂 附件
-        </Btn>
-      ) : (
-        <button className="ha-btn" onClick={() => store.setDrawer(true)}>
-          🗂 附件
-        </button>
-      )}
-      {toast.toast}
+      <button className="ha-btn" title="附件管理" onClick={() => store.setDrawer(true)}>
+        🗂
+      </button>
+      {toast.toastNode}
     </div>
   )
 }

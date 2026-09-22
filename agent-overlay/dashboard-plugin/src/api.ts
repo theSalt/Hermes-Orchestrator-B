@@ -2,7 +2,7 @@
  * 鉴权/basePath 全部交给宿主 SDK 的 authedFetch（自动带 token 头或 cookie，
  * 并拼 window.__HERMES_BASE_PATH__ 前缀——nginx subpath 部署自动正确）。
  */
-import { getSdk } from './sdk'
+import { getApi } from './sdk'
 
 const BASE = '/api/plugins/hermes-attachments'
 
@@ -16,9 +16,9 @@ export interface AttItem {
 }
 
 async function authed(url: string, init?: RequestInit): Promise<Response> {
-  const sdk = getSdk()
-  if (!sdk) throw new Error('插件 SDK 不可用')
-  const res = await sdk.api.authedFetch(url, init)
+  const api = getApi()
+  if (!api) throw new Error('插件 SDK 不可用')
+  const res = await api.authedFetch(url, init)
   if (!res.ok) {
     let detail = ''
     try {
