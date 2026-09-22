@@ -63,6 +63,25 @@ async def test_rotate_token_version():
     assert await reg.rotate_token_version("nobody") is None
 
 
+async def test_set_idle_timeout_roundtrip():
+    """None（跟随全局）/ 0（永不）/ 正数三态设置与回读。"""
+    reg = FakeRegistry()
+    await reg.create_user("alice")
+    assert (await reg.get_user("alice")).idle_timeout_minutes is None
+
+    assert (await reg.set_idle_timeout("alice", 0)).idle_timeout_minutes == 0
+    assert (await reg.get_user("alice")).idle_timeout_minutes == 0
+
+    assert (await reg.set_idle_timeout("alice", 30)).idle_timeout_minutes == 30
+
+    # 恢复跟随全局
+    u = await reg.set_idle_timeout("alice", None)
+    assert u.idle_timeout_minutes is None
+    assert (await reg.get_user("alice")).idle_timeout_minutes is None
+
+    assert await reg.set_idle_timeout("nobody", 0) is None
+
+
 def test_pg_registry_rejects_bad_table_name():
     import pytest as _pytest
 

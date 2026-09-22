@@ -34,7 +34,14 @@ function stateBadge(u: UserView) {
   )
 }
 
-export function UserTable({ users, busy, act, onLogs, onRotated }: Props) {
+/** 空闲回收策略展示文案；与后端 set_idle_timeout 语义对齐 */
+function policyLabel(minutes: number | null): string {
+  if (minutes == null) return '跟随全局'
+  if (minutes === 0) return '永不回收'
+  return `${minutes}m 上限`
+}
+
+export function UserTable({ users, busy, act, notify, onLogs, onRotated }: Props) {
   function rotate(u: UserView) {
     if (
       !confirm(
@@ -64,6 +71,31 @@ export function UserTable({ users, busy, act, onLogs, onRotated }: Props) {
     )
   }
 
+  function setIdle(u: UserView) {
+    const input = prompt(
+      `用户 ${u.user_id} 的空闲回收策略（分钟）：\n` +
+        '· 留空 = 跟随全局默认\n' +
+        '· 0 = 永不回收（messaging 重度用户推荐）\n' +
+        '· 正整数 = 自定义空闲上限',
+      u.idle_timeout_minutes == null ? '' : String(u.idle_timeout_minutes),
+    )
+    if (input === null) return
+    const trimmed = input.trim()
+    let minutes: number | null = null
+    if (trimmed !== '') {
+      const n = Number(trimmed)
+      if (!Number.isInteger(n) || n < 0) {
+        notify('err', '空闲策略须为空（跟随全局）、0（永不回收）或正整数分钟')
+        return
+      }
+      minutes = n
+    }
+    act(async () => {
+      const res = await api.setIdleTimeout(u.user_id, minutes)
+      return `空闲策略已更新：${policyLabel(res.idle_timeout_minutes)}（当前生效 ${res.effective_minutes} 分钟）`
+    })
+  }
+
   return (
     <section className="card">
       <h3>用户（{users.length}）</h3>
@@ -90,7 +122,12 @@ export function UserTable({ users, busy, act, onLogs, onRotated }: Props) {
                     {u.display_name && <div className="muted small">{u.display_name}</div>}
                   </td>
                   <td>{stateBadge(u)}</td>
-                  <td>{fmtIdle(u.idle_seconds)}</td>
+                  <td>
+                    {fmtIdle(u.idle_seconds)}
+                    <div className="muted small" title="空闲回收策略：null=跟随全局；0=永不回收；正数=自定义分钟上限">
+                      {policyLabel(u.idle_timeout_minutes)}
+                    </div>
+                  </td>
                   <td>
                     {/* token 仅创建/轮换时一次性展示，这里不再回显（遗忘走轮换） */}
                     <span className="muted" title="token 仅创建/轮换时一次性展示；遗忘请轮换">
@@ -133,6 +170,9 @@ export function UserTable({ users, busy, act, onLogs, onRotated }: Props) {
                     </button>
                     <button className="btn small" disabled={busy} onClick={() => onLogs(u.user_id)}>
                       日志
+                    </button>
+                    <button className="btn small" disabled={busy} onClick={() => setIdle(u)}>
+                      空闲策略
                     </button>
                     <button className="btn small warn" disabled={busy} onClick={() => rotate(u)}>
                       轮换 token

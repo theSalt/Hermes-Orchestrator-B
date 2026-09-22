@@ -174,6 +174,17 @@ async def sweep_once() -> list[str]:
             continue
         user_id = item["user_id"]
         if settings.idle_timeout_minutes <= 0:
+            # 全局关闭 = 功能停用，per-user 覆盖不重新打开
+            continue
+        # per-user 策略：None 跟随全局；0 永不回收（messaging 重的用户）；
+        # 正数为自定义分钟上限
+        user = await registry.get_user(user_id)
+        limit = (
+            settings.idle_timeout_minutes
+            if user is None or user.idle_timeout_minutes is None
+            else user.idle_timeout_minutes
+        )
+        if limit <= 0:
             continue
         if active_ws.get(user_id, 0) > 0:
             continue
@@ -202,8 +213,11 @@ async def sweep_once() -> list[str]:
             if started_ts is None:
                 continue
             last = started_ts
-        if now - last > settings.idle_timeout_minutes * 60:
-            logger.info("idle timeout (%.0fs): stopping agent %s", now - last, item["name"])
+        if now - last > limit * 60:
+            logger.info(
+                "idle timeout (limit=%sm, %.0fs): stopping agent %s",
+                limit, now - last, item["name"],
+            )
             await driver.stop(user_id)
             last_active.pop(user_id, None)
             stopped.append(user_id)

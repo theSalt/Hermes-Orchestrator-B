@@ -23,7 +23,7 @@ from .config import settings
 # 表名仅用于测试注入独立表；白名单校验防拼接注入
 _TABLE_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-_COLUMNS = "user_id, display_name, created_at, last_active, token_version"
+_COLUMNS = "user_id, display_name, created_at, last_active, token_version, idle_timeout_minutes"
 
 
 @dataclass
@@ -34,6 +34,9 @@ class User:
     last_active: float | None
     # 0 = 初代派生（消息 dispatch:<uid>）；管理台轮换一次 +1（消息带 #v<n>）
     token_version: int = 0
+    # 空闲回收策略（分钟）：None=跟随全局 HERMES_IDLE_TIMEOUT_MINUTES；
+    # 0=永不回收（messaging 重的用户）；正数=自定义空闲上限
+    idle_timeout_minutes: int | None = None
 
     def dict(self) -> dict:
         return {
@@ -42,6 +45,7 @@ class User:
             "created_at": self.created_at,
             "last_active": self.last_active,
             "token_version": self.token_version,
+            "idle_timeout_minutes": self.idle_timeout_minutes,
         }
 
 
@@ -64,6 +68,8 @@ class RegistryBackend(Protocol):
     async def get_last_active(self, user_id: str) -> float | None: ...
 
     async def rotate_token_version(self, user_id: str) -> int | None: ...
+
+    async def set_idle_timeout(self, user_id: str, minutes: int | None) -> User | None: ...
 
 
 def _user(row: asyncpg.Record) -> User:
@@ -93,8 +99,14 @@ class PgRegistry:
                     display_name  TEXT NOT NULL DEFAULT '',
                     created_at    DOUBLE PRECISION NOT NULL,
                     last_active   DOUBLE PRECISION,
-                    token_version INTEGER NOT NULL DEFAULT 0
+                    token_version INTEGER NOT NULL DEFAULT 0,
+                    idle_timeout_minutes INTEGER
                 )""")
+            # 旧库迁移：表已存在时 CREATE IF NOT EXISTS 不补列，逐列补齐
+            await conn.execute(
+                f"ALTER TABLE {self._table} "
+                "ADD COLUMN IF NOT EXISTS idle_timeout_minutes INTEGER"
+            )
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -162,6 +174,16 @@ class PgRegistry:
             user_id,
         )
         return row["token_version"] if row else None
+
+    async def set_idle_timeout(self, user_id: str, minutes: int | None) -> User | None:
+        """设置空闲回收策略并返回更新后的用户；用户不存在返回 None。"""
+        row = await self._require_pool().fetchrow(
+            f"UPDATE {self._table} SET idle_timeout_minutes = $2 "
+            f"WHERE user_id = $1 RETURNING {_COLUMNS}",
+            user_id,
+            minutes,
+        )
+        return _user(row) if row else None
 
 
 # 进程级单例（main lifespan 负责 start/close）

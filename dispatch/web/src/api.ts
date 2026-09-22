@@ -61,6 +61,14 @@ export const api = {
       `api/users/${encodeURIComponent(uid)}/token/rotate`,
       { method: 'POST' },
     ),
+  setIdleTimeout: (uid: string, minutes: number | null) =>
+    req<{ status: string; idle_timeout_minutes: number | null; effective_minutes: number; note: string }>(
+      `api/users/${encodeURIComponent(uid)}/idle-timeout`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ minutes }),
+      },
+    ),
   logs: (uid: string, tail = 200) =>
     req<LogsResult>(`api/users/${encodeURIComponent(uid)}/logs?tail=${tail}`),
 }

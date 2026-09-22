@@ -72,6 +72,13 @@ class FakeRegistry:
         u.token_version += 1
         return u.token_version
 
+    async def set_idle_timeout(self, user_id: str, minutes: int | None) -> User | None:
+        u = self._users.get(user_id)
+        if u is None:
+            return None
+        u.idle_timeout_minutes = minutes
+        return u
+
 
 def assert_matches_backend(reg) -> None:
     """防 fake/实现漂移：两套实现都必须满足同一 Protocol。"""

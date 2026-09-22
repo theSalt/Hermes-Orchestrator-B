@@ -463,6 +463,8 @@ def _user_view(request: Request, user: User, agent: dict | None, include_token: 
         # token 只在创建/轮换时一次性返回（include_token=True），清单不回显：
         # admin key 泄露不应等于存量 token 泄露；遗忘 token 走轮换
         "token_version": user.token_version,
+        # None=跟随全局；0=永不回收；正数=自定义分钟上限
+        "idle_timeout_minutes": user.idle_timeout_minutes,
         "container": agent,
         "idle_seconds": int(time.time() - last) if last else None,
     }
@@ -636,6 +638,31 @@ async def rotate_user_token(user_id: str, request: Request):
         "token": dispatch_token(settings.secret_key, user_id, version),
         "gateway_url": _gateway_url_for(request, user_id),
         "note": "容器已删除（数据保留）；用户需在 desktop 更新 token 后重连",
+    }
+
+
+@admin_api.put("/users/{user_id}/idle-timeout", dependencies=[Depends(require_admin)])
+async def set_idle_timeout(user_id: str, request: Request):
+    """空闲回收策略：null=跟随全局；0=永不回收；正数=自定义分钟上限。"""
+    body = await request.json() if request.headers.get("content-length") else {}
+    raw = body.get("minutes", None)
+    if raw is not None:
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+            raise HTTPException(
+                status_code=400, detail="minutes 须为 null（跟随全局）、0（永不回收）或正整数分钟"
+            )
+    user = await registry.set_idle_timeout(user_id, raw)
+    if user is None:
+        raise HTTPException(status_code=404, detail="unknown user")
+    return {
+        "status": "ok",
+        "idle_timeout_minutes": user.idle_timeout_minutes,
+        "effective_minutes": (
+            settings.idle_timeout_minutes
+            if user.idle_timeout_minutes is None
+            else user.idle_timeout_minutes
+        ),
+        "note": "0=永不回收；null=跟随全局 HERMES_IDLE_TIMEOUT_MINUTES",
     }
 
 

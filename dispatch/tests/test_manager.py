@@ -3,6 +3,8 @@
 import asyncio
 import os
 import tempfile
+import time
+from collections import defaultdict
 
 _tmp = tempfile.mkdtemp(prefix="hermes-dispatch-test-")
 os.environ.setdefault("HERMES_DATA_DIR", _tmp)
@@ -132,5 +134,146 @@ async def test_warm_async_runs_ensure_ready(monkeypatch):
     manager.warm_async("alice")  # 去重
     await asyncio.sleep(0.05)
     assert calls == ["alice"]
+
+
+# ── sweep_once 的 per-user 空闲策略 ────────────────────────────
+
+
+def _old_started(hours_ago: float = 2.0) -> str:
+    """构造足够老（避开 10 分钟保活宽限）的 StartedAt（Docker UTC ISO 格式）。"""
+    from datetime import datetime, timedelta, timezone
+
+    return (
+        datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    ).isoformat()
+
+
+def _patch_sweep_driver(monkeypatch, items: list[dict], stopped: list[str]) -> None:
+    async def fake_list_managed():
+        return items
+
+    async def fake_stop(uid):
+        stopped.append(uid)
+
+    monkeypatch.setattr(manager.driver, "list_managed", fake_list_managed)
+    monkeypatch.setattr(manager.driver, "stop", fake_stop)
+    # 隔离模块级 WS 计数：别的测试可能留下未清零的条目
+    monkeypatch.setattr(manager, "active_ws", defaultdict(int))
+
+
+async def test_sweep_follows_global_when_user_unset(monkeypatch, fake_reg):
+    """未设置 per-user 策略（None）：跟随全局 60 分钟。"""
+    await fake_reg.create_user("alice")
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 60)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "alice", "name": "hb-alice", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    idle_ago = time.time() - 61 * 60
+    monkeypatch.setattr(manager, "last_active", {"alice": idle_ago})
+
+    assert await manager.sweep_once() == ["alice"]
+    assert stopped == ["alice"]
+
+
+async def test_sweep_zero_never_stops(monkeypatch, fake_reg):
+    """per-user 0 = 永不回收：再老也不停。"""
+    await fake_reg.create_user("alice")
+    await fake_reg.set_idle_timeout("alice", 0)
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 60)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "alice", "name": "hb-alice", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    monkeypatch.setattr(
+        manager, "last_active", {"alice": time.time() - 10 * 3600}
+    )
+
+    assert await manager.sweep_once() == []
+    assert stopped == []
+
+
+async def test_sweep_custom_limit_overrides_global(monkeypatch, fake_reg):
+    """per-user 30 分钟：空闲 45 分钟即停（全局 60 分钟尚不够）。"""
+    await fake_reg.create_user("alice")
+    await fake_reg.set_idle_timeout("alice", 30)
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 60)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "alice", "name": "hb-alice", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    monkeypatch.setattr(
+        manager, "last_active", {"alice": time.time() - 45 * 60}
+    )
+
+    assert await manager.sweep_once() == ["alice"]
+    assert stopped == ["alice"]
+
+
+async def test_sweep_custom_limit_not_yet_reached(monkeypatch, fake_reg):
+    """per-user 30 分钟：空闲 10 分钟（全局 60 也没到）不停。"""
+    await fake_reg.create_user("alice")
+    await fake_reg.set_idle_timeout("alice", 30)
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 60)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "alice", "name": "hb-alice", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    monkeypatch.setattr(
+        manager, "last_active", {"alice": time.time() - 10 * 60}
+    )
+
+    assert await manager.sweep_once() == []
+    assert stopped == []
+
+
+async def test_sweep_unknown_user_falls_back_to_global(monkeypatch, fake_reg):
+    """容器在跑但注册表无记录：回退全局策略。"""
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 60)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "ghost", "name": "hb-ghost", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    monkeypatch.setattr(
+        manager, "last_active", {"ghost": time.time() - 61 * 60}
+    )
+
+    assert await manager.sweep_once() == ["ghost"]
+    assert stopped == ["ghost"]
+
+
+async def test_sweep_global_zero_disables_all(monkeypatch, fake_reg):
+    """全局 0 = 功能停用：即使 per-user 设了正数也不回收。"""
+    await fake_reg.create_user("alice")
+    await fake_reg.set_idle_timeout("alice", 30)
+    monkeypatch.setattr(manager.settings, "idle_timeout_minutes", 0)
+    stopped: list[str] = []
+    _patch_sweep_driver(
+        monkeypatch,
+        [{"user_id": "alice", "name": "hb-alice", "state": "running",
+          "started_at": _old_started()}],
+        stopped,
+    )
+    monkeypatch.setattr(
+        manager, "last_active", {"alice": time.time() - 10 * 3600}
+    )
+
+    assert await manager.sweep_once() == []
+    assert stopped == []
 
 

@@ -580,6 +580,66 @@ def test_old_token_rejected_after_rotate(client):
     assert c.get("/u/alice/", headers={"X-Hermes-Session-Token": new}).status_code == 200
 
 
+def test_idle_timeout_requires_admin(client):
+    c, _ = client
+    assert (
+        c.put("/api/users/alice/idle-timeout", json={"minutes": 0}).status_code == 401
+    )
+    r = c.put(
+        "/api/users/alice/idle-timeout",
+        json={"minutes": 0},
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert r.status_code == 401
+
+
+def test_idle_timeout_set_and_list_roundtrip(client, monkeypatch):
+    c, _ = client
+    _mkuser(c, "alice")
+    monkeypatch.setattr(settings, "idle_timeout_minutes", 90)
+    hdr = {"Authorization": "Bearer test-admin-key"}
+
+    # 0 = 永不回收
+    r = c.put("/api/users/alice/idle-timeout", json={"minutes": 0}, headers=hdr)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["idle_timeout_minutes"] == 0
+    assert body["effective_minutes"] == 0
+
+    # 自定义分钟数
+    r = c.put("/api/users/alice/idle-timeout", json={"minutes": 30}, headers=hdr)
+    assert r.json()["effective_minutes"] == 30
+
+    # null = 跟随全局（此处全局被 monkeypatch 成 90）
+    r = c.put("/api/users/alice/idle-timeout", json={"minutes": None}, headers=hdr)
+    assert r.json()["idle_timeout_minutes"] is None
+    assert r.json()["effective_minutes"] == 90
+
+    # 清单视图回显策略
+    users = c.get("/api/users", headers=hdr).json()["users"]
+    alice = next(u for u in users if u["user_id"] == "alice")
+    assert alice["idle_timeout_minutes"] is None
+
+
+def test_idle_timeout_invalid_values_400(client):
+    c, _ = client
+    _mkuser(c, "alice")
+    hdr = {"Authorization": "Bearer test-admin-key"}
+    for bad in (-5, "30", 1.5, True, [0]):
+        r = c.put("/api/users/alice/idle-timeout", json={"minutes": bad}, headers=hdr)
+        assert r.status_code == 400, f"minutes={bad!r} 应 400"
+
+
+def test_idle_timeout_unknown_user_404(client):
+    c, _ = client
+    r = c.put(
+        "/api/users/nobody/idle-timeout",
+        json={"minutes": 0},
+        headers={"Authorization": "Bearer test-admin-key"},
+    )
+    assert r.status_code == 404
+
+
 def test_logs_endpoint(client):
     c, cap = client
     _mkuser(c, "alice")

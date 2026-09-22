@@ -15,6 +15,8 @@ export interface UserView {
   /** 仅创建/轮换响应里携带；用户清单不回显 */
   token?: string
   token_version: number
+  /** 空闲回收策略（分钟）：null=跟随全局；0=永不回收；正数=自定义上限 */
+  idle_timeout_minutes: number | null
   container: AgentContainer | null
   idle_seconds: number | null
 }

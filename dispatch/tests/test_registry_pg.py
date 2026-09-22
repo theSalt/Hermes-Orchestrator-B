@@ -81,3 +81,47 @@ async def test_pg_delete(reg):
     await reg.create_user("alice")
     assert await reg.delete_user("alice") is True
     assert await reg.delete_user("alice") is False
+
+
+async def test_pg_set_idle_timeout_roundtrip(reg):
+    await reg.create_user("alice")
+    assert (await reg.get_user("alice")).idle_timeout_minutes is None
+    assert (await reg.set_idle_timeout("alice", 0)).idle_timeout_minutes == 0
+    assert (await reg.set_idle_timeout("alice", 45)).idle_timeout_minutes == 45
+    assert (await reg.set_idle_timeout("alice", None)).idle_timeout_minutes is None
+    assert await reg.set_idle_timeout("nobody", 0) is None
+
+
+async def test_pg_migrates_legacy_table_without_idle_column():
+    """旧库（无 idle_timeout_minutes 列）start 时 ALTER 补列，数据保留。"""
+    r = PgRegistry(
+        dsn=os.environ["HERMES_TEST_DATABASE_URL"],
+        table=f"users_legacy_{uuid.uuid4().hex[:8]}",
+    )
+    await r.start()
+    try:
+        async with r._pool.acquire() as conn:
+            # 手工重建换库前旧 schema（README：2026-09 前的表结构）
+            await conn.execute(f"DROP TABLE IF EXISTS {r._table}")
+            await conn.execute(f"""
+                CREATE TABLE {r._table} (
+                    user_id       TEXT PRIMARY KEY,
+                    display_name  TEXT NOT NULL DEFAULT '',
+                    created_at    DOUBLE PRECISION NOT NULL,
+                    last_active   DOUBLE PRECISION,
+                    token_version INTEGER NOT NULL DEFAULT 0
+                )""")
+            await conn.execute(
+                f"INSERT INTO {r._table} (user_id, display_name, created_at) "
+                "VALUES ('legacy-alice', 'Legacy', 1.0)"
+            )
+        await r.start()  # 补列迁移
+        u = await r.get_user("legacy-alice")
+        assert u is not None
+        assert u.idle_timeout_minutes is None
+        assert (await r.set_idle_timeout("legacy-alice", 0)).idle_timeout_minutes == 0
+    finally:
+        if r._pool is not None:
+            async with r._pool.acquire() as conn:
+                await conn.execute(f"DROP TABLE IF EXISTS {r._table}")
+            await r.close()
