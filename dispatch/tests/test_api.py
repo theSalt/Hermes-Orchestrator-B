@@ -357,6 +357,52 @@ def test_trailing_backtick_in_path_param_stripped(client):
     assert "profile=default" in cap["upstream_url"]
 
 
+def test_bold_media_label_residue_in_path_param_stripped(client):
+    """agent 把 MEDIA: 标签写成 **MEDIA:/path**（源文件） → Desktop 渲染下载
+    链接时把 ** 和中文标注一起带进 path（线上实际案例，上游按字面 404）。"""
+    from urllib.parse import parse_qsl, urlsplit
+
+    c, cap = client
+    tok = _mkuser(c, "alice")["token"]
+    for junk, expected in (
+        ("/opt/data/workspace/Hermes-Agent-介绍.pptx**（源文件）",
+         "/opt/data/workspace/Hermes-Agent-介绍.pptx"),
+        ("/opt/data/workspace/Hermes-Agent-介绍.pdf**（预览版）",
+         "/opt/data/workspace/Hermes-Agent-介绍.pdf"),
+        ("/opt/data/workspace/Hermes-Agent-介绍.pptx**（源文件）**",
+         "/opt/data/workspace/Hermes-Agent-介绍.pptx"),
+    ):
+        r = c.get(
+            "/u/alice/api/fs/download",
+            params={"path": junk, "profile": "default"},
+            headers={"X-Hermes-Session-Token": tok},
+        )
+        assert r.status_code == 200
+        upstream_query = dict(parse_qsl(urlsplit(cap["upstream_url"]).query))
+        assert upstream_query["path"] == expected
+
+
+def test_path_param_cleanup_does_not_touch_legit_names(client):
+    """括号在中间（后接扩展名）或无扩展名收尾的真实文件名必须原样透传。"""
+    from urllib.parse import parse_qsl, urlsplit
+
+    c, cap = client
+    tok = _mkuser(c, "alice")["token"]
+    for legit in (
+        "/opt/data/workspace/会议纪要（终稿）.docx",
+        "/opt/data/workspace/笔记（源文件）",
+        "/opt/data/workspace/notes(final).txt",
+    ):
+        r = c.get(
+            "/u/alice/api/fs/download",
+            params={"path": legit, "profile": "default"},
+            headers={"X-Hermes-Session-Token": tok},
+        )
+        assert r.status_code == 200
+        upstream_query = dict(parse_qsl(urlsplit(cap["upstream_url"]).query))
+        assert upstream_query["path"] == legit
+
+
 def test_ws_accepts_cookie_auth(client, monkeypatch):
     c, _ = client
     _mkuser(c, "alice")

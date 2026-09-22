@@ -4,6 +4,7 @@
 """
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -245,11 +246,36 @@ def _wait_seconds(stripped: str = "") -> float:
     return float(settings.proxy_start_wait_seconds)
 
 
-def _strip_backtick_path(query: str) -> str:
-    """Desktop 把 agent 消息里 `...` 代码格式的文件路径渲染成下载链接时，
-    会把结尾反引号带进 path 参数（上游按字面 404）。正常文件名不会以反引号
-    结尾，这里剥掉并留痕。"""
-    if "`" not in query and "%60" not in query:
+# Desktop 渲染 agent 消息里的下载链接时会把 markdown 尾渣带进 path 参数
+# （上游按字面 404）。已知两类实际案例：
+#   ① `...` 代码格式路径 → 结尾反引号：/path/report.pptx`
+#   ② agent 把 MEDIA: 标签写成加粗并追加中文标注：
+#      **MEDIA:/path/Hermes-Agent-介绍.pptx**（源文件）
+#      → path 收到 /path/Hermes-Agent-介绍.pptx**（源文件）
+# 正常文件名不会以反引号/星号结尾（* 在 Windows/macOS 为非法文件名字符）；
+# 结尾括号标注只在「括号前的主干以扩展名收尾」时才剥——report（终稿）.docx
+# 这类括号后还有扩展名的真实文件名不受影响。
+_TRAILING_LABEL_RE = re.compile(r"[（(][^()（）/\\]{0,32}[）)]$")
+_EXT_SUFFIX_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+_PATH_QUERY_TRIGGER_CHARS = ("`", "*", "(", ")", "（", "）",
+                             "%60", "%2a", "%28", "%29", "%ef%bc%88", "%ef%bc%89")
+
+
+def _clean_media_path(value: str) -> str:
+    """剥掉 path 值结尾的 markdown 尾渣（反引号/星号/括号标注），循环至稳定。"""
+    prev = None
+    while prev != value:
+        prev = value
+        value = value.rstrip("`*")
+        m = _TRAILING_LABEL_RE.search(value)
+        if m and _EXT_SUFFIX_RE.search(value[: m.start()].rstrip("`*")):
+            value = value[: m.start()]
+    return value
+
+
+def _sanitize_path_query(query: str) -> str:
+    lowered = query.lower()
+    if not any(ch in lowered for ch in _PATH_QUERY_TRIGGER_CHARS):
         return query
     from urllib.parse import parse_qsl, urlencode
 
@@ -257,12 +283,14 @@ def _strip_backtick_path(query: str) -> str:
     changed = False
     fixed = []
     for k, v in pairs:
-        if k == "path" and v.rstrip("`") != v:
-            v = v.rstrip("`")
-            changed = True
+        if k == "path":
+            cleaned = _clean_media_path(v)
+            if cleaned != v:
+                v = cleaned
+                changed = True
         fixed.append((k, v))
     if changed:
-        logger.info("stripped trailing backtick(s) from path param (desktop rendering quirk)")
+        logger.info("stripped trailing markdown residue from path param (desktop rendering quirk)")
         return urlencode(fixed)
     return query
 
@@ -297,7 +325,7 @@ async def _proxy_http_entry(request: Request):
     async def attempt(ep: manager.AgentEndpoint):
         upstream_url = f"{ep.base_url}/{stripped}"
         if request.url.query:
-            upstream_url += f"?{_strip_backtick_path(request.url.query)}"
+            upstream_url += f"?{_sanitize_path_query(request.url.query)}"
         return await proxy.proxy_http(method, upstream_url, headers=headers, request_stream=body_stream)
 
     try:

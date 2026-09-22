@@ -214,11 +214,18 @@ dispatch 侧探活 5 秒内快速返回并自动后台预热，重试一两次�
 不会被回收。刚（重）启动的容器有 10 分钟保活宽限。容器被回收后再次访问会自动拉起
 （约 10-30 秒），无需干预。
 
-### ⑤ 下载文件报 404（路径末尾多反引号）
+### ⑤ 下载文件报 404（路径末尾混入 markdown 残留）
 
-Desktop 把 agent 消息里 `` `/path/to/file` `` 代码格式路径渲染成下载链接时，会把结尾反引号
-带进 `path` 参数，上游按字面 404（实际文件存在）。dispatch 已自动剥掉 `path` 参数末尾的
-反引号并在日志留痕（`stripped trailing backtick(s)`），此类下载链接可直接用。临时绕过：
+Desktop 把 agent 消息里的文件引用渲染成下载链接时，会把 markdown 尾渣带进 `path` 参数，
+上游按字面 404（实际文件存在）。已知两类实际案例：
+
+- `` `...` `` 代码格式路径 → 结尾反引号：`/path/report.pptx``
+- agent 把 MEDIA: 标签写成加粗并追加中文标注（`**MEDIA:/path/x.pptx**（源文件）`）
+  → path 收到 `/path/x.pptx**（源文件）`
+
+dispatch 已对 `path` 参数统一剥尾（反引号/星号/结尾括号标注；括号仅在前面主干以扩展名
+收尾时才剥，`报告（终稿）.docx` 这类真实文件名不受影响），日志留痕
+`stripped trailing markdown residue from path param`，此类下载链接可直接用。临时绕过：
 在 Desktop 文件页浏览 workspace 下载，或让 agent 把文件复制成不带特殊字符的名字。
 
 ## API 一览
