@@ -1,0 +1,19 @@
+# 办公包安装时的约束文件：锁死 hermes 自身关键依赖的当前版本，
+# 防止 uv 解析新包时顺手升级（甚至降级）这些包导致 hermes 运行异常。
+# 基线镜像升级后需对照 `uv pip list` 同步更新本文件。
+httpx==0.28.1
+httpcore==1.0.9
+openai==2.24.0
+anthropic==0.87.0
+pydantic==2.13.4
+typing-extensions==4.15.0
+pillow==12.3.0
+jinja2==3.1.6
+markupsafe==3.0.3
+requests==2.33.0
+rich==14.3.3
+python-dateutil==2.9.0.post0
+pytz==2025.2
+pyyaml==6.0.3
+six==1.17.0
+tqdm==4.67.3

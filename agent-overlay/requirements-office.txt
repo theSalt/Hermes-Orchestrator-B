@@ -1,0 +1,36 @@
+# 常用办公处理类 Python 包（agent 的 Python 沙箱可直接 import）。
+# 保持不锁版本：由 uv 按 constraints-hermes.txt 保护 hermes 既有关键依赖后取最新兼容版。
+#
+# --- Word / PPT / Excel / ODF ---
+python-docx        # Word .docx 读写
+docxtpl            # Word 模板渲染（docx + jinja2）
+python-pptx        # PPT .pptx 读写
+openpyxl           # Excel .xlsx 读写
+XlsxWriter         # Excel .xlsx 高性能写
+xlrd               # 旧版 .xls 读取
+odfpy              # OpenDocument（ODT/ODS/ODP）读写
+
+# --- PDF ---
+pypdf              # 合并/拆分/加密/元数据
+pdfplumber         # 文本与表格抽取
+PyMuPDF            # 高性能渲染/抽取/批注（import fitz）
+reportlab          # PDF 生成（表格/图表排版）
+pikepdf            # PDF 修复/加密/线性化（qpdf 绑定）
+pdf2image          # PDF→图片（依赖系统 poppler-utils）
+
+# --- 邮件 / HTML ---
+# 收发协议本身走标准库（smtplib/imaplib/email）；这里补 HTML 与 IMAP 体验
+beautifulsoup4     # HTML 解析（邮件正文/网页）
+lxml               # 高性能 XML/HTML 解析
+html2text          # HTML→Markdown
+IMAPClient         # 更友好的 IMAP 客户端（import imapclient）
+
+# --- 数据 / 图表 ---
+pandas             # 数据处理与 Excel IO
+numpy              # 数值计算（pandas/matplotlib 依赖）
+matplotlib         # 图表生成（可嵌入 Word/PPT/PDF）
+tabulate           # 表格文本化（df.to_markdown）
+chardet            # 文件编码探测
+
+# --- OCR ---
+pytesseract        # tesseract 的 Python 封装（依赖系统 tesseract-ocr）

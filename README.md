@@ -49,7 +49,12 @@ docker compose ps        # postgres 应为 healthy
 docker compose logs -f dispatch
 ```
 
-首次 `up` 会自动构建 overlay 镜像 `hermes-agent:desktop`（基于 1ms.run 基线 + dashboard-forwarder）。基线镜像更新后：`docker compose build agent-image && curl -XPOST .../api/agents/refresh`。
+首次 `up` 会自动构建 overlay 镜像 `hermes-agent:desktop`（基于 1ms.run 基线 + dashboard-forwarder + 办公处理包）。基线镜像更新后：`docker compose build agent-image && curl -XPOST .../api/agents/refresh`。
+
+**overlay 内置办公处理能力**（`agent-overlay/`，agent 的 Python 沙箱可直接用）：
+- Python 包（`requirements-office.txt`）：Word（python-docx / docxtpl）、PPT（python-pptx）、Excel（openpyxl / XlsxWriter / xlrd）、ODF（odfpy）、PDF（pypdf / PyMuPDF / pdfplumber / reportlab / pikepdf / pdf2image）、邮件（IMAPClient + 标准库 smtplib/imaplib/email，bs4 / lxml / html2text 处理 HTML 正文）、数据图表（pandas / numpy / matplotlib）、OCR（pytesseract）。
+- 系统工具：LibreOffice（`soffice --headless --convert-to pdf` 做 doc/ppt/xls→pdf）、poppler、qpdf、tesseract（含中文）、Noto CJK 中文字体、zip/unzip。
+- hermes 既有关键依赖（httpx / openai / pydantic / pillow 等）由 `constraints-hermes.txt` 锁版本；**基线镜像升级后需对照基线 `uv pip list` 同步更新该文件**，否则约束里是旧版本号会导致构建失败或依赖被顶。
 
 管理台前端（React + Vite）由 dispatch 镜像的多阶段构建自动完成（node 阶段 `npm run build` → 产物进 `/app/static/admin`）；本地开发用 `cd dispatch/web && npm install && npm run dev`（vite :5173 代理到本机 :8644）。改动前端后需重新 `docker compose build dispatch`。
 
@@ -275,7 +280,8 @@ cd dispatch && python3 -m pytest tests -q   # 单元测试（不起容器；PG �
 ## 运维备忘
 
 - **换模型/改 env**：改 `.env` → `docker compose up -d dispatch`（env 变了）→ `POST /api/agents/refresh`；只改模型配置种子则还需清用户卷上的 INIT 标记或提升 `driver.INIT_VERSION`
-- **基线镜像升级**：`docker pull <基线>` → `docker compose build agent-image` → `POST /api/agents/refresh`
+- **基线镜像升级**：`docker pull <基线>` → 同步更新 `agent-overlay/constraints-hermes.txt`（对照基线 `uv pip list`）→ `docker compose build agent-image` → 冒烟验证（`scripts/smoke.sh` 协议面 + `scripts/office-smoke.sh` 办公包，后者在服务器上 `docker run --rm --entrypoint bash --memory=2g -v .../office-smoke.sh:/tmp/office-smoke.sh hermes-agent:desktop /tmp/office-smoke.sh`）→ `POST /api/agents/refresh`
+- **overlay 办公包增删**：改 `agent-overlay/requirements-office.txt` 后重新 `docker compose build agent-image`；注意 uv 步骤必须带 `--no-config`（基线 WORKDIR=/opt/hermes 的 pyproject.toml 设了 `exclude-newer="14 days"`，否则新包解析被冻结在两周前）。Himalaya 二进制随仓库分发（`agent-overlay/vendor/`），升级时下载新 release 覆盖并同步 Dockerfile 里的 sha256
 - **用户忘 token**：token 不再回显（仅创建/轮换时展示一次）——走单用户轮换，把新 token 交给用户重配 desktop
 - **单用户换 token**：管理台「轮换 token」或 `POST /api/users/{uid}/token/rotate`——旧 token 立即失效、容器重建（数据保留），desktop 需更新 token 重连
 - **彻底删用户**：`DELETE /api/users/{uid}?purge=1`（容器+记忆/会话/文件全清）

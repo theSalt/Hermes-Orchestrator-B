@@ -107,6 +107,8 @@ services:
       context: ./agent-overlay
       args:
         BASE_IMAGE: ${HERMES_BASE_IMAGE:-docker.1ms.run/nousresearch/hermes-agent:latest}
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+        PYPI_INDEX: ${HERMES_PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: ${HERMES_IMAGE:-hermes-agent:desktop}
     entrypoint: ["true"]
     restart: "no"
